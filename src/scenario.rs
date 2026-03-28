@@ -2,10 +2,30 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail, ensure};
+use chrono::Duration;
+use ipnet::Ipv4Net;
+use serde::{Deserialize, Serialize};
 
 const SUPPORTED_VERSION: &str = "1";
+
+/// Parses a human-readable duration string like "5m", "30s", or "2h".
+pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_suffix('s') {
+        let secs: i64 = rest.parse().context("invalid seconds in duration")?;
+        return Duration::try_seconds(secs).context("duration seconds out of range");
+    }
+    if let Some(rest) = s.strip_suffix('m') {
+        let mins: i64 = rest.parse().context("invalid minutes in duration")?;
+        return Duration::try_minutes(mins).context("duration minutes out of range");
+    }
+    if let Some(rest) = s.strip_suffix('h') {
+        let hours: i64 = rest.parse().context("invalid hours in duration")?;
+        return Duration::try_hours(hours).context("duration hours out of range");
+    }
+    bail!("unsupported duration format '{s}': expected suffix s, m, or h")
+}
 
 /// Loads and validates a scenario from a YAML file.
 pub(crate) fn load(path: &Path) -> Result<Scenario> {
@@ -19,13 +39,10 @@ pub(crate) fn load(path: &Path) -> Result<Scenario> {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Scenario {
-    version: String,
+    pub(crate) version: String,
     pub(crate) metadata: Metadata,
-    // Pipeline will consume these once generation is implemented.
-    #[allow(dead_code)]
-    environment: Environment,
-    #[allow(dead_code)]
-    duration: String,
+    pub(crate) environment: Environment,
+    pub(crate) duration: String,
     pub(crate) infrastructure: Infrastructure,
     pub(crate) activities: Activities,
 }
@@ -33,20 +50,17 @@ pub(crate) struct Scenario {
 #[derive(Debug, Deserialize)]
 pub(crate) struct Metadata {
     pub(crate) name: String,
-    // Pipeline will consume this once generation is implemented.
     #[allow(dead_code)]
-    description: String,
+    pub(crate) description: String,
 }
 
-// Pipeline will consume these fields once generation is implemented.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct Environment {
-    scale: Scale,
-    encryption: Encryption,
-    workload: Workload,
-    threat: Threat,
-    attacker: Attacker,
+    pub(crate) scale: Scale,
+    pub(crate) encryption: Encryption,
+    pub(crate) workload: Workload,
+    pub(crate) threat: Threat,
+    pub(crate) attacker: Attacker,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,14 +69,12 @@ pub(crate) struct Infrastructure {
     pub(crate) network: Network,
 }
 
-// Pipeline will consume os, role, and image once generation is implemented.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct Host {
-    name: String,
-    os: Os,
-    role: Role,
-    image: String,
+    pub(crate) name: String,
+    pub(crate) os: Os,
+    pub(crate) role: Role,
+    pub(crate) image: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,13 +82,11 @@ pub(crate) struct Network {
     pub(crate) segments: Vec<Segment>,
 }
 
-// Pipeline will consume subnet once generation is implemented.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct Segment {
-    name: String,
-    subnet: String,
-    hosts: Vec<String>,
+    pub(crate) name: String,
+    pub(crate) subnet: String,
+    pub(crate) hosts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,38 +97,34 @@ pub(crate) struct Activities {
     pub(crate) attack: Vec<AttackActivity>,
 }
 
-// Pipeline will consume command, protocol, dst_port, and start_offset
-// once generation is implemented.
-#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct NormalActivity {
-    name: String,
-    source: String,
-    target: String,
-    command: String,
-    protocol: Protocol,
-    dst_port: u16,
-    start_offset: String,
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) command: String,
+    pub(crate) protocol: Protocol,
+    pub(crate) dst_port: u16,
+    pub(crate) start_offset: String,
 }
 
-// Pipeline will consume command, protocol, dst_port, technique, phase,
-// tool, and start_offset once generation is implemented.
-#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct AttackActivity {
-    name: String,
-    source: String,
-    target: String,
-    command: String,
-    protocol: Protocol,
-    dst_port: u16,
-    technique: String,
-    phase: Phase,
-    tool: String,
-    start_offset: String,
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) command: String,
+    pub(crate) protocol: Protocol,
+    pub(crate) dst_port: u16,
+    pub(crate) technique: String,
+    pub(crate) phase: Phase,
+    pub(crate) tool: String,
+    pub(crate) start_offset: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Scale {
     Minimal,
@@ -127,14 +133,14 @@ pub(crate) enum Scale {
     Large,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Encryption {
     None,
     Tls,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Workload {
     Light,
@@ -142,28 +148,28 @@ pub(crate) enum Workload {
     Heavy,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Threat {
     Single,
     Multi,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Attacker {
     Scripted,
     Adaptive,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Os {
     Linux,
     Windows,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Role {
     Attacker,
@@ -171,7 +177,7 @@ pub(crate) enum Role {
     Observer,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Protocol {
     Tcp,
@@ -179,7 +185,7 @@ pub(crate) enum Protocol {
     Icmp,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
     Reconnaissance,
@@ -227,6 +233,9 @@ impl Scenario {
             self.version,
         );
 
+        parse_duration(&self.duration)
+            .with_context(|| format!("invalid duration '{}'", self.duration))?;
+
         ensure!(
             !self.infrastructure.hosts.is_empty(),
             "scenario must define at least one host",
@@ -257,6 +266,12 @@ impl Scenario {
                 segment_names.insert(segment.name.as_str()),
                 "duplicate segment name '{}'",
                 segment.name,
+            );
+            ensure!(
+                segment.subnet.parse::<Ipv4Net>().is_ok(),
+                "segment '{}' has invalid subnet CIDR '{}'",
+                segment.name,
+                segment.subnet,
             );
             for host_ref in &segment.hosts {
                 ensure!(
@@ -446,6 +461,43 @@ activities:
         assert_eq!(s.infrastructure.hosts.len(), 1);
         assert!(s.activities.normal.is_empty());
         assert!(s.activities.attack.is_empty());
+    }
+
+    // ── Duration validation ───────────────────────────────────────
+
+    #[test]
+    fn reject_invalid_duration_format() {
+        let yaml = MINIMAL_YAML.replace("duration: 1m", "duration: 5x");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid duration"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_non_numeric_duration() {
+        let yaml = MINIMAL_YAML.replace("duration: 1m", "duration: foom");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid"),
+            "unexpected error: {err}",
+        );
+    }
+
+    // ── Subnet validation ────────────────────────────────────────
+
+    #[test]
+    fn reject_invalid_subnet_cidr() {
+        let yaml = MINIMAL_YAML.replace("subnet: 10.0.0.0/24", "subnet: not-a-cidr");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid subnet CIDR"),
+            "unexpected error: {err}",
+        );
     }
 
     // ── Version validation ────────────────────────────────────────
@@ -1075,6 +1127,61 @@ activities:
             "unexpected error: {err}",
         );
     }
+
+    // ── Duration parsing ──────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_seconds() {
+        let d = parse_duration("30s").unwrap();
+        assert_eq!(d.num_seconds(), 30);
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        let d = parse_duration("5m").unwrap();
+        assert_eq!(d.num_seconds(), 300);
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        let d = parse_duration("2h").unwrap();
+        assert_eq!(d.num_seconds(), 7200);
+    }
+
+    #[test]
+    fn parse_duration_invalid_suffix() {
+        let err = parse_duration("10d").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported duration format"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_duration_invalid_number() {
+        let err = parse_duration("abcm").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_duration_with_whitespace() {
+        let d = parse_duration("  5m  ").unwrap();
+        assert_eq!(d.num_seconds(), 300);
+    }
+
+    #[test]
+    fn parse_duration_empty_string() {
+        let err = parse_duration("").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported duration format"),
+            "unexpected error: {err}",
+        );
+    }
+
+    // ── E2E: load() from file ─────────────────────────────────────
 
     #[test]
     fn load_valid_yaml_but_invalid_scenario() {
