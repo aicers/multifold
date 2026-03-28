@@ -1,7 +1,10 @@
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+mod scenario;
 
 #[derive(Parser)]
 #[command(
@@ -51,10 +54,16 @@ fn main() -> ExitCode {
     }
 }
 
-// Stubs: will contain fallible logic once pipeline is implemented.
-#[allow(clippy::unnecessary_wraps)]
-fn generate(scenario: &str, output: &str) -> Result<()> {
-    println!("generate: scenario={scenario}, output={output}");
+fn generate(scenario_path: &str, output: &str) -> Result<()> {
+    let scenario = scenario::load(Path::new(scenario_path))?;
+    println!(
+        "Loaded scenario '{}': {} host(s), {} segment(s), {} normal + {} attack activities → {output}",
+        scenario.metadata.name,
+        scenario.infrastructure.hosts.len(),
+        scenario.infrastructure.network.segments.len(),
+        scenario.activities.normal.len(),
+        scenario.activities.attack.len(),
+    );
     Ok(())
 }
 
