@@ -20,13 +20,13 @@
       "name": "attacker-001",
       "os": "linux",
       "role": "attacker",
-      "ip": "10.100.0.2"
+      "ips": ["10.100.0.2"]
     },
     {
       "name": "target-001",
       "os": "linux",
       "role": "target",
-      "ip": "10.100.0.3"
+      "ips": ["10.100.0.3"]
     }
   ],
   "network": {
@@ -38,6 +38,11 @@
     ]
   },
   "capture": {
-    "pcap": "net/capture.pcap"
+    "pcaps": [
+      {
+        "segment": "lan",
+        "path": "net/capture-lan.pcap"
+      }
+    ]
   }
 }
