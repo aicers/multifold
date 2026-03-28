@@ -1,0 +1,19 @@
+[package]
+name = "multifold"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+pedantic = "warn"
+unwrap_used = "warn"

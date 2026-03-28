@@ -1,0 +1,43 @@
+{
+  "schema_version": "1",
+  "scenario": "ac-0.scenario.yaml",
+  "scenario_version": "1",
+  "generated_at": "2026-01-15T09:00:00Z",
+  "duration": {
+    "total": "5m",
+    "actual_start": "2026-01-15T09:00:00Z",
+    "actual_end": "2026-01-15T09:05:00Z"
+  },
+  "environment": {
+    "scale": "minimal",
+    "encryption": "none",
+    "workload": "light",
+    "threat": "single",
+    "attacker": "scripted"
+  },
+  "hosts": [
+    {
+      "name": "attacker-001",
+      "os": "linux",
+      "role": "attacker",
+      "ip": "10.100.0.2"
+    },
+    {
+      "name": "target-001",
+      "os": "linux",
+      "role": "target",
+      "ip": "10.100.0.3"
+    }
+  ],
+  "network": {
+    "segments": [
+      {
+        "name": "lan",
+        "subnet": "10.100.0.0/24"
+      }
+    ]
+  },
+  "capture": {
+    "pcap": "net/capture.pcap"
+  }
+}

@@ -1,0 +1,59 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust Formatting
+        run: cargo fmt -- --check --config group_imports=StdExternalCrate
+
+      - name: Check Rust Lints (Clippy)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit || true
+
+      - name: Run Security Audit
+        run: cargo audit
+
+  test:
+    name: Test
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
+        run: cargo test
