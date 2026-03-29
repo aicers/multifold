@@ -322,14 +322,14 @@ mod tests {
     #[test]
     fn parse_pcap_empty_file_errors() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("empty.pcap"), &[]).unwrap();
+        std::fs::write(dir.path().join("empty.pcap"), []).unwrap();
         assert!(parse_pcap(&dir.path().join("empty.pcap")).is_err());
     }
 
     #[test]
     fn parse_pcap_invalid_magic_errors() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("bad.pcap"), &[0u8; 24]).unwrap();
+        std::fs::write(dir.path().join("bad.pcap"), [0u8; 24]).unwrap();
         assert!(parse_pcap(&dir.path().join("bad.pcap")).is_err());
     }
 
@@ -365,8 +365,6 @@ mod tests {
         ts: i64,
     ) -> Execution {
         use chrono::TimeZone;
-
-        use crate::activity::AttackDetail;
         let start = chrono::Utc.timestamp_opt(ts, 0).unwrap();
         let end = chrono::Utc.timestamp_opt(ts + 1, 0).unwrap();
         Execution {
