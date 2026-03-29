@@ -20,6 +20,7 @@ pub(crate) struct Execution {
     pub(crate) target: String,
     pub(crate) protocol: Protocol,
     pub(crate) src_ip: Ipv4Addr,
+    pub(crate) src_port: u16,
     pub(crate) dst_ip: Ipv4Addr,
     pub(crate) dst_port: u16,
     pub(crate) attack: Option<AttackDetail>,
@@ -97,6 +98,7 @@ pub(crate) async fn run(
             target: activity.target.to_owned(),
             protocol: activity.protocol,
             src_ip,
+            src_port: 0,
             dst_ip,
             dst_port: activity.dst_port,
             attack: activity.attack.as_ref().map(|a| AttackDetail {
@@ -567,7 +569,7 @@ mod tests {
 
         let before = Utc::now();
         let past_start = before - chrono::Duration::try_hours(1).unwrap();
-        let results = run(
+        let mut results = run(
             &env.docker,
             &env.host_containers,
             &env.host_ips,
@@ -577,6 +579,7 @@ mod tests {
         .await
         .unwrap();
 
+        crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
         crate::ground_truth::write(dir.path(), &results).unwrap();
 
         let content = std::fs::read_to_string(gt_dir.join("manifest.jsonl")).unwrap();
@@ -590,6 +593,7 @@ mod tests {
         assert_eq!(r0["session_type"], "network");
         assert_eq!(r0["protocol"], "tcp");
         assert_eq!(r0["src_ip"], "10.100.0.2");
+        assert!(r0["src_port"].is_number(), "src_port must be present");
         assert_eq!(r0["dst_ip"], "10.100.0.3");
         assert_eq!(r0["dst_port"], 80);
         assert!(r0.get("category").is_none());
@@ -612,6 +616,10 @@ mod tests {
         assert_eq!(r1["phase"], "reconnaissance");
         assert_eq!(r1["tool"], "nmap");
         assert_eq!(r1["src_ip"], "10.100.0.2");
+        assert!(
+            r1["src_port"].is_number(),
+            "attack src_port must be present"
+        );
         assert_eq!(r1["dst_ip"], "10.100.0.3");
 
         let attack_start_str = r1["start"].as_str().unwrap();

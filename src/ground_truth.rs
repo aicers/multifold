@@ -20,6 +20,7 @@ struct Record {
     session_type: &'static str,
     protocol: Protocol,
     src_ip: String,
+    src_port: u16,
     dst_ip: String,
     dst_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +63,7 @@ pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
             session_type: "network",
             protocol: exec.protocol,
             src_ip: exec.src_ip.to_string(),
+            src_port: exec.src_port,
             dst_ip: exec.dst_ip.to_string(),
             dst_port: exec.dst_port,
             category,
@@ -104,6 +106,7 @@ mod tests {
             target: "target-001".to_owned(),
             protocol: Protocol::Tcp,
             src_ip: Ipv4Addr::new(10, 100, 0, 2),
+            src_port: 49152,
             dst_ip: Ipv4Addr::new(10, 100, 0, 3),
             dst_port: 80,
             attack: None,
@@ -118,6 +121,7 @@ mod tests {
             target: "target-001".to_owned(),
             protocol: Protocol::Tcp,
             src_ip: Ipv4Addr::new(10, 100, 0, 2),
+            src_port: 50000,
             dst_ip: Ipv4Addr::new(10, 100, 0, 3),
             dst_port: 80,
             attack: Some(AttackDetail {
@@ -173,6 +177,7 @@ mod tests {
         assert_eq!(record["session_type"], "network");
         assert_eq!(record["protocol"], "tcp");
         assert_eq!(record["src_ip"], "10.100.0.2");
+        assert_eq!(record["src_port"], 49152);
         assert_eq!(record["dst_ip"], "10.100.0.3");
         assert_eq!(record["dst_port"], 80);
     }
@@ -204,6 +209,7 @@ mod tests {
         assert_eq!(record["session_type"], "network");
         assert_eq!(record["protocol"], "tcp");
         assert_eq!(record["src_ip"], "10.100.0.2");
+        assert_eq!(record["src_port"], 50000);
         assert_eq!(record["dst_ip"], "10.100.0.3");
         assert_eq!(record["dst_port"], 80);
         assert_eq!(record["category"], "attack");
@@ -257,6 +263,7 @@ mod tests {
             "session_type",
             "protocol",
             "src_ip",
+            "src_port",
             "dst_ip",
             "dst_port",
         ];
@@ -289,6 +296,7 @@ mod tests {
             "session_type",
             "protocol",
             "src_ip",
+            "src_port",
             "dst_ip",
             "dst_port",
             "category",

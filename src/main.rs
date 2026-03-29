@@ -10,6 +10,7 @@ mod activity;
 mod ground_truth;
 mod infra;
 mod meta;
+mod pcap;
 mod scenario;
 
 #[derive(Parser)]
@@ -106,7 +107,7 @@ async fn run_and_record(
     output_dir: &Path,
     start: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let executions = activity::run(
+    let mut executions = activity::run(
         &env.docker,
         &env.host_containers,
         &env.host_ips,
@@ -115,6 +116,10 @@ async fn run_and_record(
     )
     .await?;
     println!("Executed {} activity(ies)", executions.len());
+
+    let net_dir = output_dir.join("net");
+    pcap::enrich_src_ports(&net_dir, &mut executions)?;
+    println!("Enriched source ports from pcap");
 
     ground_truth::write(output_dir, &executions)?;
     println!("Wrote ground_truth/manifest.jsonl");
