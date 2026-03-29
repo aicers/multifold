@@ -24,10 +24,11 @@ const LINUX_IFNAMSIZ: usize = 15;
 /// Each entry in `host_ips` maps a host name to **all** IPs assigned
 /// across every segment the host belongs to (primary first).
 pub(crate) struct ProvisionedEnv {
-    docker: Docker,
+    pub(crate) docker: Docker,
     network_ids: Vec<String>,
     container_ids: Vec<String>,
     pub(crate) host_ips: Vec<(String, Vec<Ipv4Addr>)>,
+    pub(crate) host_containers: Vec<(String, String)>,
 }
 
 /// Per-segment state accumulated during provisioning.
@@ -112,6 +113,7 @@ impl ProvisionedEnv {
             network_ids: Vec::new(),
             container_ids: Vec::new(),
             host_ips: Vec::new(),
+            host_containers: Vec::new(),
         };
 
         let run_id = generate_run_id();
@@ -187,6 +189,7 @@ impl ProvisionedEnv {
                         .await
                         .with_context(|| format!("failed to start container '{container_name}'"))?;
                     self.container_ids.push(id.clone());
+                    self.host_containers.push((host_name.clone(), id.clone()));
                     created.insert(host_name.clone(), id);
                     self.host_ips.push((host_name.clone(), vec![*ip]));
                 }
@@ -554,6 +557,19 @@ mod tests {
         assert_eq!(env.host_ips[0].1, vec![Ipv4Addr::new(10, 100, 0, 2)]);
         assert_eq!(env.host_ips[1].0, "target-001");
         assert_eq!(env.host_ips[1].1, vec![Ipv4Addr::new(10, 100, 0, 3)]);
+
+        // host_containers must map each host to a valid container ID.
+        assert_eq!(env.host_containers.len(), 2);
+        assert_eq!(env.host_containers[0].0, "attacker-001");
+        assert!(
+            !env.host_containers[0].1.is_empty(),
+            "container ID must be non-empty"
+        );
+        assert_eq!(env.host_containers[1].0, "target-001");
+        assert!(
+            !env.host_containers[1].1.is_empty(),
+            "container ID must be non-empty"
+        );
 
         env.down().await.unwrap();
     }

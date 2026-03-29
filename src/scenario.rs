@@ -97,7 +97,6 @@ pub(crate) struct Activities {
     pub(crate) attack: Vec<AttackActivity>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct NormalActivity {
     pub(crate) name: String,
@@ -109,7 +108,6 @@ pub(crate) struct NormalActivity {
     pub(crate) start_offset: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct AttackActivity {
     pub(crate) name: String,
