@@ -1106,6 +1106,20 @@ activities:
     }
 
     #[test]
+    fn load_mixed_distro_from_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-1-mixed-distro.scenario.yaml");
+        let s = load(&path).unwrap();
+        assert_eq!(s.metadata.name, "ac-1-mixed-distro");
+        assert_eq!(s.infrastructure.hosts.len(), 3);
+        assert_eq!(s.infrastructure.hosts[0].image, "alpine:3.19");
+        assert_eq!(s.infrastructure.hosts[1].image, "ubuntu:22.04");
+        assert_eq!(s.infrastructure.hosts[2].image, "ubuntu:22.04");
+        assert_eq!(s.infrastructure.hosts[2].role, Role::Observer);
+    }
+
+    #[test]
     fn load_nonexistent_file() {
         let err = load(Path::new("/no/such/file.yaml")).unwrap_err();
         assert!(

@@ -1,0 +1,62 @@
+version: "1"
+
+metadata:
+  name: ac-1-mixed-distro
+  description: >-
+    Mixed-distro acceptance scenario. Three Linux containers — an Alpine
+    attacker, an Ubuntu target, and an Ubuntu observer that is never an
+    activity source — on one segment. Exercises distro-agnostic tool
+    installation and source-only filtering.
+
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+
+duration: 5m
+
+infrastructure:
+  hosts:
+    - name: attacker-alpine
+      os: linux
+      role: attacker
+      image: alpine:3.19
+    - name: target-ubuntu
+      os: linux
+      role: target
+      image: ubuntu:22.04
+    - name: observer-ubuntu
+      os: linux
+      role: observer
+      image: ubuntu:22.04
+  network:
+    segments:
+      - name: lan
+        subnet: 10.200.0.0/24
+        hosts:
+          - attacker-alpine
+          - target-ubuntu
+          - observer-ubuntu
+
+activities:
+  normal:
+    - name: http-health-check
+      source: attacker-alpine
+      target: target-ubuntu
+      command: "curl -s http://${target_ip}:80/"
+      protocol: tcp
+      dst_port: 80
+      start_offset: 30s
+  attack:
+    - name: nmap-port-scan
+      source: attacker-alpine
+      target: target-ubuntu
+      command: "nmap -sS -p 80 ${target_ip}"
+      protocol: tcp
+      dst_port: 80
+      technique: T1046
+      phase: reconnaissance
+      tool: nmap
+      start_offset: 120s
