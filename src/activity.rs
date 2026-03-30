@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
@@ -61,7 +62,13 @@ pub(crate) async fn run(
     activities: &Activities,
     generation_start: DateTime<Utc>,
 ) -> Result<Vec<Execution>> {
-    install_tools(docker, host_containers).await?;
+    let sources = activity_sources(activities);
+    let source_containers: Vec<_> = host_containers
+        .iter()
+        .filter(|(name, _)| sources.contains(name.as_str()))
+        .map(|(n, id)| (n.clone(), id.clone()))
+        .collect();
+    install_tools(docker, &source_containers).await?;
 
     let mut schedule = build_schedule(activities)?;
     schedule.sort_unstable_by_key(|s| s.offset);
@@ -176,22 +183,61 @@ fn lookup_container<'a>(host_containers: &'a [(String, String)], host: &str) -> 
         .with_context(|| format!("no container found for host '{host}'"))
 }
 
+/// Returns the set of host names that appear as activity sources.
+fn activity_sources(activities: &Activities) -> HashSet<&str> {
+    let mut sources = HashSet::new();
+    for a in &activities.normal {
+        sources.insert(a.source.as_str());
+    }
+    for a in &activities.attack {
+        sources.insert(a.source.as_str());
+    }
+    sources
+}
+
+/// Installs curl and nmap in each source container, skipping hosts that
+/// already have both tools.  Detects the package manager (`apk` vs
+/// `apt-get`) at runtime so that both Alpine and Debian/Ubuntu images work.
 async fn install_tools(docker: &Docker, host_containers: &[(String, String)]) -> Result<()> {
     for (host, container_id) in host_containers {
+        if has_tool(docker, container_id, "curl").await?
+            && has_tool(docker, container_id, "nmap").await?
+        {
+            println!("  Tools already present in {host}, skipping install");
+            continue;
+        }
+
+        let install_cmd = detect_install_cmd(docker, container_id)
+            .await
+            .with_context(|| format!("no supported package manager in '{host}'"))?;
+
         println!("  Installing tools in {host}…");
-        let code = exec_in_container(
-            docker,
-            container_id,
-            "apk add --no-cache curl nmap >/dev/null 2>&1",
-        )
-        .await
-        .with_context(|| format!("failed to install tools in '{host}'"))?;
+        let code = exec_in_container(docker, container_id, install_cmd)
+            .await
+            .with_context(|| format!("failed to install tools in '{host}'"))?;
         anyhow::ensure!(
             code == 0,
             "tool installation failed in '{host}' (exit code {code})",
         );
     }
     Ok(())
+}
+
+async fn has_tool(docker: &Docker, container_id: &str, tool: &str) -> Result<bool> {
+    let cmd = format!("command -v {tool} >/dev/null 2>&1");
+    Ok(exec_in_container(docker, container_id, &cmd).await? == 0)
+}
+
+async fn detect_install_cmd(docker: &Docker, container_id: &str) -> Result<&'static str> {
+    if has_tool(docker, container_id, "apk").await? {
+        return Ok("apk add --no-cache curl nmap >/dev/null 2>&1");
+    }
+    if has_tool(docker, container_id, "apt-get").await? {
+        return Ok(
+            "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl nmap >/dev/null 2>&1",
+        );
+    }
+    anyhow::bail!("expected apk or apt-get")
 }
 
 /// Executes a shell command inside a container and waits for completion.
@@ -438,6 +484,62 @@ mod tests {
         assert!(build_schedule(&activities).is_err());
     }
 
+    // ── activity_sources ──────────────────────────────────────────
+
+    #[test]
+    fn activity_sources_empty() {
+        let activities = Activities {
+            normal: vec![],
+            attack: vec![],
+        };
+        assert!(activity_sources(&activities).is_empty());
+    }
+
+    #[test]
+    fn activity_sources_collects_unique_sources() {
+        let activities = Activities {
+            normal: vec![make_normal("a", "10s", 80), make_normal("b", "20s", 80)],
+            attack: vec![make_attack("c", "30s")],
+        };
+        let sources = activity_sources(&activities);
+        // All three activities share source "src" (from make_normal/make_attack).
+        assert_eq!(sources.len(), 1);
+        assert!(sources.contains("src"));
+    }
+
+    #[test]
+    fn activity_sources_includes_both_normal_and_attack() {
+        let activities = Activities {
+            normal: vec![NormalActivity {
+                name: "n".to_owned(),
+                source: "host-a".to_owned(),
+                target: "host-b".to_owned(),
+                command: "echo hi".to_owned(),
+                protocol: Protocol::Tcp,
+                dst_port: 80,
+                start_offset: "10s".to_owned(),
+            }],
+            attack: vec![AttackActivity {
+                name: "a".to_owned(),
+                source: "host-c".to_owned(),
+                target: "host-a".to_owned(),
+                command: "nmap ${target_ip}".to_owned(),
+                protocol: Protocol::Tcp,
+                dst_port: 80,
+                technique: "T1046".to_owned(),
+                phase: Phase::Reconnaissance,
+                tool: "nmap".to_owned(),
+                start_offset: "20s".to_owned(),
+            }],
+        };
+        let sources = activity_sources(&activities);
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains("host-a"));
+        assert!(sources.contains("host-c"));
+        // host-b is only a target, not a source.
+        assert!(!sources.contains("host-b"));
+    }
+
     // ── template substitution ─────────────────────────────────────
 
     #[test]
@@ -548,6 +650,13 @@ mod tests {
             "normal should complete before attack starts",
         );
 
+        // target-001 is never a source, so it should not have tools.
+        let target_id = lookup_container(&env.host_containers, "target-001").unwrap();
+        assert!(
+            !has_tool(&env.docker, target_id, "nmap").await.unwrap(),
+            "target-only host should not have nmap installed",
+        );
+
         env.down().await.unwrap();
     }
 
@@ -628,6 +737,209 @@ mod tests {
             attack_start_ts >= start_ts,
             "attack should start after normal",
         );
+
+        env.down().await.unwrap();
+    }
+
+    // ── Mixed-distro E2E tests ───────────────────────────────────
+
+    fn load_mixed_distro() -> crate::scenario::Scenario {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-1-mixed-distro.scenario.yaml");
+        crate::scenario::load(&path).unwrap()
+    }
+
+    /// Alpine + Ubuntu hosts on the same segment complete without error.
+    /// The attacker (Alpine) is the only activity source and must receive
+    /// tools via `apk add`; the Ubuntu hosts (target + observer) must
+    /// NOT be touched by tool installation.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn mixed_distro_installs_tools_only_in_source() {
+        let scenario = load_mixed_distro();
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let past_start = Utc::now() - chrono::Duration::try_hours(1).unwrap();
+        let results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            past_start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2, "expected 1 normal + 1 attack execution");
+        assert_eq!(results[0].source, "attacker-alpine");
+        assert_eq!(results[1].source, "attacker-alpine");
+
+        // The Alpine attacker should now have curl and nmap.
+        let attacker_id = lookup_container(&env.host_containers, "attacker-alpine").unwrap();
+        assert!(has_tool(&env.docker, attacker_id, "curl").await.unwrap());
+        assert!(has_tool(&env.docker, attacker_id, "nmap").await.unwrap());
+
+        // Observer (Ubuntu) is never an activity source, so it should
+        // NOT have curl or nmap installed.
+        let observer_id = lookup_container(&env.host_containers, "observer-ubuntu").unwrap();
+        assert!(
+            !has_tool(&env.docker, observer_id, "curl").await.unwrap(),
+            "observer should not have curl installed",
+        );
+        assert!(
+            !has_tool(&env.docker, observer_id, "nmap").await.unwrap(),
+            "observer should not have nmap installed",
+        );
+
+        env.down().await.unwrap();
+    }
+
+    /// When an Ubuntu host is an activity source, tools are installed
+    /// via `apt-get` without errors.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn ubuntu_source_installs_tools_via_apt() {
+        let mut scenario = load_mixed_distro();
+
+        // Swap source/target so that apt-get is exercised on Ubuntu.
+        scenario.activities.normal[0].source = "target-ubuntu".to_owned();
+        scenario.activities.normal[0].target = "attacker-alpine".to_owned();
+        scenario.activities.attack[0].source = "target-ubuntu".to_owned();
+        scenario.activities.attack[0].target = "attacker-alpine".to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let past_start = Utc::now() - chrono::Duration::try_hours(1).unwrap();
+        let results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            past_start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        // The Ubuntu source should now have curl and nmap.
+        let ubuntu_id = lookup_container(&env.host_containers, "target-ubuntu").unwrap();
+        assert!(has_tool(&env.docker, ubuntu_id, "curl").await.unwrap());
+        assert!(has_tool(&env.docker, ubuntu_id, "nmap").await.unwrap());
+
+        // The Alpine host was not a source, so tools were not installed.
+        let alpine_id = lookup_container(&env.host_containers, "attacker-alpine").unwrap();
+        assert!(
+            !has_tool(&env.docker, alpine_id, "curl").await.unwrap(),
+            "non-source Alpine host should not have curl",
+        );
+
+        env.down().await.unwrap();
+    }
+
+    /// Both Alpine and Ubuntu hosts are activity sources simultaneously.
+    /// Verifies that `apk` and `apt-get` are both used in a single run
+    /// and the observer (not a source) is left untouched.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn dual_distro_sources_install_tools_concurrently() {
+        let mut scenario = load_mixed_distro();
+
+        // Make target-ubuntu also a source (in addition to attacker-alpine).
+        scenario.activities.attack[0].source = "target-ubuntu".to_owned();
+        scenario.activities.attack[0].target = "attacker-alpine".to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let past_start = Utc::now() - chrono::Duration::try_hours(1).unwrap();
+        let results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            past_start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].source, "attacker-alpine");
+        assert_eq!(results[1].source, "target-ubuntu");
+
+        // Both sources should have tools.
+        let alpine_id = lookup_container(&env.host_containers, "attacker-alpine").unwrap();
+        assert!(has_tool(&env.docker, alpine_id, "curl").await.unwrap());
+        assert!(has_tool(&env.docker, alpine_id, "nmap").await.unwrap());
+
+        let ubuntu_id = lookup_container(&env.host_containers, "target-ubuntu").unwrap();
+        assert!(has_tool(&env.docker, ubuntu_id, "curl").await.unwrap());
+        assert!(has_tool(&env.docker, ubuntu_id, "nmap").await.unwrap());
+
+        // Observer is still untouched.
+        let observer_id = lookup_container(&env.host_containers, "observer-ubuntu").unwrap();
+        assert!(
+            !has_tool(&env.docker, observer_id, "nmap").await.unwrap(),
+            "observer should not have nmap",
+        );
+
+        env.down().await.unwrap();
+    }
+
+    /// If tools are already present, `install_tools` skips the install step
+    /// and succeeds immediately.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn pre_installed_tools_are_skipped() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let sources = activity_sources(&scenario.activities);
+        let source_containers: Vec<_> = env
+            .host_containers
+            .iter()
+            .filter(|(name, _)| sources.contains(name.as_str()))
+            .map(|(n, id)| (n.clone(), id.clone()))
+            .collect();
+
+        // First install.
+        install_tools(&env.docker, &source_containers)
+            .await
+            .unwrap();
+
+        // Verify tools are present.
+        let id = lookup_container(&env.host_containers, "attacker-001").unwrap();
+        assert!(has_tool(&env.docker, id, "curl").await.unwrap());
+        assert!(has_tool(&env.docker, id, "nmap").await.unwrap());
+
+        // Second install should skip (and not fail).
+        install_tools(&env.docker, &source_containers)
+            .await
+            .unwrap();
 
         env.down().await.unwrap();
     }
