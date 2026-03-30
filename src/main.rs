@@ -12,6 +12,8 @@ mod infra;
 mod meta;
 mod pcap;
 mod scenario;
+#[cfg(test)]
+mod test_util;
 
 #[derive(Parser)]
 #[command(
@@ -184,13 +186,7 @@ fn validate(bundle: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_ac0() -> scenario::Scenario {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scenarios")
-            .join("ac-0.scenario.yaml");
-        scenario::load(&path).unwrap()
-    }
+    use crate::test_util::load_ac0;
 
     // ── assemble_bundle ────────────────────────────────────────
 
@@ -451,30 +447,48 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn generate_ac0_produces_valid_bundle() {
-        let scenario_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scenarios")
-            .join("ac-0.scenario.yaml");
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().to_str().unwrap();
+        // Create a temp copy of the scenario with a unique subnet.
+        let subnet = test_util::unique_subnet();
+        let original = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scenarios")
+                .join("ac-0.scenario.yaml"),
+        )
+        .unwrap();
+        let modified = original.replace("10.100.0.0/24", &subnet);
 
-        generate(scenario_path.to_str().unwrap(), output)
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scenario_path = dir.path().join("ac-0.scenario.yaml");
+        fs::write(&scenario_path, &modified).unwrap();
+
+        let output_dir = dir.path().join("output");
+        generate(
+            scenario_path.to_str().unwrap(),
+            output_dir.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Derive expected IPs from the assigned subnet.
+        let hosts = vec!["attacker-001".to_owned(), "target-001".to_owned()];
+        let (_, expected_ips) = infra::assign_ips(&subnet, &hosts).unwrap();
+        let attacker_ip = expected_ips[0].1.to_string();
+        let target_ip = expected_ips[1].1.to_string();
 
         // ── Bundle directory structure ────────────────────────────
-        assert!(dir.path().join("net").is_dir());
-        assert!(dir.path().join("ground_truth").is_dir());
-        assert!(dir.path().join("host/attacker-001").is_dir());
-        assert!(dir.path().join("host/target-001").is_dir());
+        assert!(output_dir.join("net").is_dir());
+        assert!(output_dir.join("ground_truth").is_dir());
+        assert!(output_dir.join("host/attacker-001").is_dir());
+        assert!(output_dir.join("host/target-001").is_dir());
 
         // ── PCAP present and non-empty ───────────────────────────
-        let pcap_path = dir.path().join("net/capture-lan.pcap");
+        let pcap_path = output_dir.join("net/capture-lan.pcap");
         assert!(pcap_path.exists(), "pcap file was not created");
         let pcap_len = fs::metadata(&pcap_path).unwrap().len();
         assert!(pcap_len > 24, "pcap must be larger than the global header");
 
         // ── meta.json ────────────────────────────────────────────
-        let meta_path = dir.path().join("meta.json");
+        let meta_path = output_dir.join("meta.json");
         assert!(meta_path.exists(), "meta.json was not created");
         let meta_content = fs::read_to_string(&meta_path).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
@@ -482,16 +496,16 @@ mod tests {
         assert_eq!(meta["scenario"], "ac-0.scenario.yaml");
         assert_eq!(meta["duration"]["total"], "5m");
         assert_eq!(meta["hosts"][0]["name"], "attacker-001");
-        assert_eq!(meta["hosts"][0]["ips"][0], "10.100.0.2");
+        assert_eq!(meta["hosts"][0]["ips"][0], attacker_ip);
         assert_eq!(meta["hosts"][1]["name"], "target-001");
-        assert_eq!(meta["hosts"][1]["ips"][0], "10.100.0.3");
+        assert_eq!(meta["hosts"][1]["ips"][0], target_ip);
         assert_eq!(meta["network"]["segments"][0]["name"], "lan");
-        assert_eq!(meta["network"]["segments"][0]["subnet"], "10.100.0.0/24");
+        assert_eq!(meta["network"]["segments"][0]["subnet"], subnet);
         assert_eq!(meta["capture"]["pcaps"][0]["segment"], "lan");
         assert_eq!(meta["capture"]["pcaps"][0]["path"], "net/capture-lan.pcap",);
 
         // ── ground_truth/manifest.jsonl ──────────────────────────
-        let gt_path = dir.path().join("ground_truth/manifest.jsonl");
+        let gt_path = output_dir.join("ground_truth/manifest.jsonl");
         assert!(gt_path.exists(), "manifest.jsonl was not created");
         let gt_content = fs::read_to_string(&gt_path).unwrap();
         let lines: Vec<&str> = gt_content.lines().collect();
@@ -505,12 +519,12 @@ mod tests {
         assert_eq!(r0["target"], "target-001");
         assert_eq!(r0["session_type"], "network");
         assert_eq!(r0["protocol"], "tcp");
-        assert_eq!(r0["src_ip"], "10.100.0.2");
+        assert_eq!(r0["src_ip"], attacker_ip);
         assert!(
             r0["src_port"].as_u64().unwrap() > 0,
             "src_port must be enriched"
         );
-        assert_eq!(r0["dst_ip"], "10.100.0.3");
+        assert_eq!(r0["dst_ip"], target_ip);
         assert_eq!(r0["dst_port"], 80);
         assert!(
             r0.get("category").is_none(),
@@ -525,12 +539,12 @@ mod tests {
         assert_eq!(r1["target"], "target-001");
         assert_eq!(r1["session_type"], "network");
         assert_eq!(r1["protocol"], "tcp");
-        assert_eq!(r1["src_ip"], "10.100.0.2");
+        assert_eq!(r1["src_ip"], attacker_ip);
         assert!(
             r1["src_port"].as_u64().unwrap() > 0,
             "src_port must be enriched"
         );
-        assert_eq!(r1["dst_ip"], "10.100.0.3");
+        assert_eq!(r1["dst_ip"], target_ip);
         assert_eq!(r1["dst_port"], 80);
         assert_eq!(r1["category"], "attack");
         assert_eq!(r1["technique"], "T1046");

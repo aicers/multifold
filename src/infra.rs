@@ -549,29 +549,28 @@ mod tests {
 
     // ── Docker E2E tests ──────────────────────────────────────────
 
-    fn load_ac0() -> crate::scenario::Scenario {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scenarios")
-            .join("ac-0.scenario.yaml");
-        crate::scenario::load(&path).unwrap()
-    }
+    use crate::test_util::{isolate_subnets, load_ac0};
 
     /// Provisions and tears down ac-0 infrastructure — requires Docker.
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn provision_ac0_assigns_correct_ips() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();
 
         let env = ProvisionedEnv::up(&scenario, &net_dir).await.unwrap();
 
+        let seg = &scenario.infrastructure.network.segments[0];
+        let (_, expected_ips) = assign_ips(&seg.subnet, &seg.hosts).unwrap();
+
         assert_eq!(env.host_ips.len(), 2);
         assert_eq!(env.host_ips[0].0, "attacker-001");
-        assert_eq!(env.host_ips[0].1, vec![Ipv4Addr::new(10, 100, 0, 2)]);
+        assert_eq!(env.host_ips[0].1, vec![expected_ips[0].1]);
         assert_eq!(env.host_ips[1].0, "target-001");
-        assert_eq!(env.host_ips[1].1, vec![Ipv4Addr::new(10, 100, 0, 3)]);
+        assert_eq!(env.host_ips[1].1, vec![expected_ips[1].1]);
 
         // host_containers must map each host to a valid container ID.
         assert_eq!(env.host_containers.len(), 2);
@@ -610,7 +609,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn provisioned_containers_have_connectivity() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();
@@ -657,7 +657,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn stop_collectors_stops_capture_containers() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();
@@ -716,7 +717,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn teardown_removes_containers_and_networks() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();

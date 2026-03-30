@@ -565,12 +565,7 @@ mod tests {
 
     // ── Docker E2E tests ──────────────────────────────────────────
 
-    fn load_ac0() -> crate::scenario::Scenario {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scenarios")
-            .join("ac-0.scenario.yaml");
-        crate::scenario::load(&path).unwrap()
-    }
+    use crate::test_util::{isolate_subnets, load_ac0, load_mixed_distro};
 
     /// Provisions ac-0 containers, runs both activities immediately
     /// (using a past start time to skip offset waits), and verifies
@@ -578,7 +573,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn exec_activities_in_ac0_containers() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();
@@ -604,6 +600,11 @@ mod tests {
 
         assert_eq!(results.len(), 2, "expected 1 normal + 1 attack execution");
 
+        let seg = &scenario.infrastructure.network.segments[0];
+        let (_, expected_ips) = crate::infra::assign_ips(&seg.subnet, &seg.hosts).unwrap();
+        let expected_src = expected_ips[0].1;
+        let expected_dst = expected_ips[1].1;
+
         // First result (normal — lower offset 30s).
         let normal = &results[0];
         assert!(normal.attack.is_none());
@@ -611,8 +612,8 @@ mod tests {
         assert_eq!(normal.target, "target-001");
         assert_eq!(normal.protocol, Protocol::Tcp);
         assert_eq!(normal.dst_port, 80);
-        assert_eq!(normal.src_ip, Ipv4Addr::new(10, 100, 0, 2));
-        assert_eq!(normal.dst_ip, Ipv4Addr::new(10, 100, 0, 3));
+        assert_eq!(normal.src_ip, expected_src);
+        assert_eq!(normal.dst_ip, expected_dst);
 
         // Timestamps must be actual wall-clock times, not estimated.
         assert!(
@@ -631,8 +632,8 @@ mod tests {
         assert_eq!(detail.technique, "T1046");
         assert_eq!(detail.phase, Phase::Reconnaissance);
         assert_eq!(detail.tool, "nmap");
-        assert_eq!(attack.src_ip, Ipv4Addr::new(10, 100, 0, 2));
-        assert_eq!(attack.dst_ip, Ipv4Addr::new(10, 100, 0, 3));
+        assert_eq!(attack.src_ip, expected_src);
+        assert_eq!(attack.dst_ip, expected_dst);
 
         assert!(
             attack.start >= before,
@@ -665,7 +666,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn activities_produce_valid_ground_truth() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         let gt_dir = dir.path().join("ground_truth");
@@ -691,6 +693,11 @@ mod tests {
         crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
         crate::ground_truth::write(dir.path(), &results).unwrap();
 
+        let seg = &scenario.infrastructure.network.segments[0];
+        let (_, expected_ips) = crate::infra::assign_ips(&seg.subnet, &seg.hosts).unwrap();
+        let attacker_ip = expected_ips[0].1.to_string();
+        let target_ip = expected_ips[1].1.to_string();
+
         let content = std::fs::read_to_string(gt_dir.join("manifest.jsonl")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -701,9 +708,9 @@ mod tests {
         assert_eq!(r0["label"], "normal");
         assert_eq!(r0["session_type"], "network");
         assert_eq!(r0["protocol"], "tcp");
-        assert_eq!(r0["src_ip"], "10.100.0.2");
+        assert_eq!(r0["src_ip"], attacker_ip);
         assert!(r0["src_port"].is_number(), "src_port must be present");
-        assert_eq!(r0["dst_ip"], "10.100.0.3");
+        assert_eq!(r0["dst_ip"], target_ip);
         assert_eq!(r0["dst_port"], 80);
         assert!(r0.get("category").is_none());
         assert!(r0.get("technique").is_none());
@@ -724,12 +731,12 @@ mod tests {
         assert_eq!(r1["technique"], "T1046");
         assert_eq!(r1["phase"], "reconnaissance");
         assert_eq!(r1["tool"], "nmap");
-        assert_eq!(r1["src_ip"], "10.100.0.2");
+        assert_eq!(r1["src_ip"], attacker_ip);
         assert!(
             r1["src_port"].is_number(),
             "attack src_port must be present"
         );
-        assert_eq!(r1["dst_ip"], "10.100.0.3");
+        assert_eq!(r1["dst_ip"], target_ip);
 
         let attack_start_str = r1["start"].as_str().unwrap();
         let attack_start_ts = chrono::DateTime::parse_from_rfc3339(attack_start_str).unwrap();
@@ -743,13 +750,6 @@ mod tests {
 
     // ── Mixed-distro E2E tests ───────────────────────────────────
 
-    fn load_mixed_distro() -> crate::scenario::Scenario {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scenarios")
-            .join("ac-1-mixed-distro.scenario.yaml");
-        crate::scenario::load(&path).unwrap()
-    }
-
     /// Alpine + Ubuntu hosts on the same segment complete without error.
     /// The attacker (Alpine) is the only activity source and must receive
     /// tools via `apk add`; the Ubuntu hosts (target + observer) must
@@ -757,7 +757,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn mixed_distro_installs_tools_only_in_source() {
-        let scenario = load_mixed_distro();
+        let mut scenario = load_mixed_distro();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();
@@ -807,6 +808,7 @@ mod tests {
     #[ignore = "requires Docker daemon"]
     async fn ubuntu_source_installs_tools_via_apt() {
         let mut scenario = load_mixed_distro();
+        isolate_subnets(&mut scenario);
 
         // Swap source/target so that apt-get is exercised on Ubuntu.
         scenario.activities.normal[0].source = "target-ubuntu".to_owned();
@@ -857,6 +859,7 @@ mod tests {
     #[ignore = "requires Docker daemon"]
     async fn dual_distro_sources_install_tools_concurrently() {
         let mut scenario = load_mixed_distro();
+        isolate_subnets(&mut scenario);
 
         // Make target-ubuntu also a source (in addition to attacker-alpine).
         scenario.activities.attack[0].source = "target-ubuntu".to_owned();
@@ -909,7 +912,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn pre_installed_tools_are_skipped() {
-        let scenario = load_ac0();
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
         let dir = tempfile::tempdir().unwrap();
         let net_dir = dir.path().join("net");
         std::fs::create_dir_all(&net_dir).unwrap();

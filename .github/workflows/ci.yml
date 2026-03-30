@@ -57,3 +57,20 @@ jobs:
 
       - name: Run Tests
         run: cargo test
+
+  docker-e2e:
+    name: Docker E2E
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Docker E2E Tests
+        run: cargo test -- --ignored
