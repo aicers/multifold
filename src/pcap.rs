@@ -20,35 +20,38 @@ const IP_PROTO_ICMP: u8 = 1;
 ///
 /// For each execution, finds the first packet in any `.pcap` file under
 /// `net_dir` whose (`src_ip`, `dst_ip`, `dst_port`, `protocol`) tuple matches
-/// within the execution's time window.
+/// within the execution's time window.  Matched packets are consumed so
+/// that no single packet is reused across executions.  Timestamps are
+/// compared at microsecond precision.
 pub(crate) fn enrich_src_ports(net_dir: &Path, executions: &mut [Execution]) -> Result<()> {
-    let packets = read_all_packets(net_dir)?;
+    let mut packets = read_all_packets(net_dir)?;
     for exec in executions.iter_mut() {
-        let start_ts = exec.start.timestamp();
-        let end_ts = exec.end.timestamp();
-        exec.src_port = packets
+        let start_us = exec.start.timestamp_micros();
+        let end_us = exec.end.timestamp_micros() + 1_000_000;
+        let idx = packets
             .iter()
-            .find(|p| {
-                p.src_ip == exec.src_ip
+            .position(|p| {
+                p.ts_us >= start_us
+                    && p.ts_us <= end_us
+                    && p.src_ip == exec.src_ip
                     && p.dst_ip == exec.dst_ip
                     && p.dst_port == exec.dst_port
                     && p.protocol == exec.protocol
-                    && p.ts >= start_ts
-                    && p.ts <= end_ts + 1
             })
-            .map(|p| p.src_port)
             .with_context(|| {
                 format!(
                     "no packet in pcap matching {} -> {}:{} ({:?}) between {} and {}",
                     exec.src_ip, exec.dst_ip, exec.dst_port, exec.protocol, exec.start, exec.end,
                 )
             })?;
+        exec.src_port = packets[idx].src_port;
+        packets.remove(idx);
     }
     Ok(())
 }
 
 struct Packet {
-    ts: i64,
+    ts_us: i64,
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     protocol: Protocol,
@@ -70,6 +73,7 @@ fn read_all_packets(net_dir: &Path) -> Result<Vec<Packet>> {
     Ok(packets)
 }
 
+#[allow(clippy::similar_names)] // ts_sec / ts_usec are pcap spec field names
 fn parse_pcap(path: &Path) -> Result<Vec<Packet>> {
     let data =
         std::fs::read(path).with_context(|| format!("failed to read pcap: {}", path.display()))?;
@@ -90,6 +94,8 @@ fn parse_pcap(path: &Path) -> Result<Vec<Packet>> {
 
     while offset + PACKET_HEADER_LEN <= data.len() {
         let ts_sec = read_u32(&data, offset, le);
+        let ts_usec = read_u32(&data, offset + 4, le);
+        let ts_us = i64::from(ts_sec) * 1_000_000 + i64::from(ts_usec);
         let incl_len = read_u32(&data, offset + 8, le);
 
         let Some(incl_len) = usize::try_from(incl_len).ok() else {
@@ -101,7 +107,7 @@ fn parse_pcap(path: &Path) -> Result<Vec<Packet>> {
         }
 
         if let Some(pkt_data) = data.get(pkt_start..pkt_start + incl_len)
-            && let Some(pkt) = parse_ethernet_packet(pkt_data, i64::from(ts_sec))
+            && let Some(pkt) = parse_ethernet_packet(pkt_data, ts_us)
         {
             packets.push(pkt);
         }
@@ -129,7 +135,7 @@ fn read_u32(data: &[u8], offset: usize, le: bool) -> u32 {
     }
 }
 
-fn parse_ethernet_packet(data: &[u8], ts: i64) -> Option<Packet> {
+fn parse_ethernet_packet(data: &[u8], ts_us: i64) -> Option<Packet> {
     if data.len() < ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN {
         return None;
     }
@@ -161,7 +167,7 @@ fn parse_ethernet_packet(data: &[u8], ts: i64) -> Option<Packet> {
                 Protocol::Udp
             };
             Some(Packet {
-                ts,
+                ts_us,
                 src_ip,
                 dst_ip,
                 protocol,
@@ -170,7 +176,7 @@ fn parse_ethernet_packet(data: &[u8], ts: i64) -> Option<Packet> {
             })
         }
         IP_PROTO_ICMP => Some(Packet {
-            ts,
+            ts_us,
             src_ip,
             dst_ip,
             protocol: Protocol::Icmp,
@@ -199,11 +205,12 @@ mod tests {
         buf
     }
 
-    fn pcap_packet_record(ts_sec: u32, payload: &[u8]) -> Vec<u8> {
+    #[allow(clippy::similar_names)] // pcap spec field names
+    fn pcap_packet_record(ts_sec: u32, ts_usec: u32, payload: &[u8]) -> Vec<u8> {
         let len = u32::try_from(payload.len()).unwrap();
         let mut buf = Vec::with_capacity(PACKET_HEADER_LEN + payload.len());
         buf.extend_from_slice(&ts_sec.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // ts_usec
+        buf.extend_from_slice(&ts_usec.to_le_bytes());
         buf.extend_from_slice(&len.to_le_bytes()); // incl_len
         buf.extend_from_slice(&len.to_le_bytes()); // orig_len
         buf.extend_from_slice(payload);
@@ -251,10 +258,10 @@ mod tests {
         pkt
     }
 
-    fn write_pcap(dir: &Path, name: &str, packets: &[(u32, Vec<u8>)]) {
+    fn write_pcap(dir: &Path, name: &str, packets: &[(u32, u32, Vec<u8>)]) {
         let mut data = pcap_global_header();
-        for (ts, payload) in packets {
-            data.extend(pcap_packet_record(*ts, payload));
+        for (ts_sec, ts_usec, payload) in packets {
+            data.extend(pcap_packet_record(*ts_sec, *ts_usec, payload));
         }
         std::fs::write(dir.join(name), data).unwrap();
     }
@@ -264,13 +271,13 @@ mod tests {
     #[test]
     fn parse_tcp_packet() {
         let frame = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
-        let pkt = parse_ethernet_packet(&frame, 1000).unwrap();
+        let pkt = parse_ethernet_packet(&frame, 1_000_000_000).unwrap();
         assert_eq!(pkt.src_ip, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(pkt.dst_ip, Ipv4Addr::new(10, 0, 0, 3));
         assert_eq!(pkt.src_port, 49152);
         assert_eq!(pkt.dst_port, 80);
         assert_eq!(pkt.protocol, Protocol::Tcp);
-        assert_eq!(pkt.ts, 1000);
+        assert_eq!(pkt.ts_us, 1_000_000_000);
     }
 
     #[test]
@@ -311,12 +318,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
         let pkt2 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 50000, 443);
-        write_pcap(dir.path(), "test.pcap", &[(100, pkt1), (200, pkt2)]);
+        write_pcap(dir.path(), "test.pcap", &[(100, 0, pkt1), (200, 0, pkt2)]);
 
         let packets = parse_pcap(&dir.path().join("test.pcap")).unwrap();
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].src_port, 49152);
         assert_eq!(packets[1].src_port, 50000);
+    }
+
+    #[test]
+    fn parse_pcap_preserves_microsecond_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
+        write_pcap(dir.path(), "us.pcap", &[(1000, 500_000, pkt)]);
+
+        let packets = parse_pcap(&dir.path().join("us.pcap")).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].ts_us, 1_000_500_000);
     }
 
     #[test]
@@ -346,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
         let mut data = pcap_global_header();
-        data.extend(pcap_packet_record(100, &pkt));
+        data.extend(pcap_packet_record(100, 0, &pkt));
         // Append a truncated packet header (only 8 of 16 bytes)
         data.extend_from_slice(&[0u8; 8]);
         std::fs::write(dir.path().join("trunc.pcap"), data).unwrap();
@@ -364,9 +382,30 @@ mod tests {
         protocol: Protocol,
         ts: i64,
     ) -> Execution {
+        make_execution_us(src_ip, dst_ip, dst_port, protocol, ts * 1_000_000)
+    }
+
+    fn make_execution_us(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        protocol: Protocol,
+        start_us: i64,
+    ) -> Execution {
         use chrono::TimeZone;
-        let start = chrono::Utc.timestamp_opt(ts, 0).unwrap();
-        let end = chrono::Utc.timestamp_opt(ts + 1, 0).unwrap();
+        let start = chrono::Utc
+            .timestamp_opt(
+                start_us / 1_000_000,
+                u32::try_from(start_us % 1_000_000 * 1_000).unwrap(),
+            )
+            .unwrap();
+        let end_us = start_us + 1_000_000;
+        let end = chrono::Utc
+            .timestamp_opt(
+                end_us / 1_000_000,
+                u32::try_from(end_us % 1_000_000 * 1_000).unwrap(),
+            )
+            .unwrap();
         Execution {
             start,
             end,
@@ -385,7 +424,7 @@ mod tests {
     fn enrich_fills_src_port_from_pcap() {
         let dir = tempfile::tempdir().unwrap();
         let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
-        write_pcap(dir.path(), "capture.pcap", &[(1000, pkt)]);
+        write_pcap(dir.path(), "capture.pcap", &[(1000, 0, pkt)]);
 
         let mut execs = vec![make_execution(
             Ipv4Addr::new(10, 0, 0, 2),
@@ -404,7 +443,11 @@ mod tests {
         // Two packets to same dst, different times and src_ports.
         let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
         let pkt2 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 50000, 80);
-        write_pcap(dir.path(), "capture.pcap", &[(1000, pkt1), (2000, pkt2)]);
+        write_pcap(
+            dir.path(),
+            "capture.pcap",
+            &[(1000, 0, pkt1), (2000, 0, pkt2)],
+        );
 
         let mut execs = vec![
             make_execution(
@@ -432,7 +475,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Packet to port 443, but execution expects port 80.
         let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 443);
-        write_pcap(dir.path(), "capture.pcap", &[(1000, pkt)]);
+        write_pcap(dir.path(), "capture.pcap", &[(1000, 0, pkt)]);
 
         let mut execs = vec![make_execution(
             Ipv4Addr::new(10, 0, 0, 2),
@@ -457,8 +500,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
         let pkt2 = tcp_frame([172, 16, 0, 2], [172, 16, 0, 3], 51000, 443);
-        write_pcap(dir.path(), "capture-lan.pcap", &[(1000, pkt1)]);
-        write_pcap(dir.path(), "capture-dmz.pcap", &[(1000, pkt2)]);
+        write_pcap(dir.path(), "capture-lan.pcap", &[(1000, 0, pkt1)]);
+        write_pcap(dir.path(), "capture-dmz.pcap", &[(1000, 0, pkt2)]);
 
         let mut execs = vec![
             make_execution(
@@ -486,7 +529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("readme.txt"), "not a pcap").unwrap();
         let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
-        write_pcap(dir.path(), "capture.pcap", &[(1000, pkt)]);
+        write_pcap(dir.path(), "capture.pcap", &[(1000, 0, pkt)]);
 
         let mut execs = vec![make_execution(
             Ipv4Addr::new(10, 0, 0, 2),
@@ -497,5 +540,102 @@ mod tests {
         )];
         enrich_src_ports(dir.path(), &mut execs).unwrap();
         assert_eq!(execs[0].src_port, 49152);
+    }
+
+    #[test]
+    fn enrich_consumed_packet_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only one packet, but two executions want it — second must fail.
+        let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
+        write_pcap(dir.path(), "capture.pcap", &[(1000, 0, pkt)]);
+
+        let mut execs = vec![
+            make_execution(
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 3),
+                80,
+                Protocol::Tcp,
+                1000,
+            ),
+            make_execution(
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 3),
+                80,
+                Protocol::Tcp,
+                1000,
+            ),
+        ];
+        assert!(enrich_src_ports(dir.path(), &mut execs).is_err());
+    }
+
+    #[test]
+    fn enrich_three_overlapping_executions_preserve_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three same-4-tuple packets at sub-second offsets within one second.
+        let pkt0 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49000, 80);
+        let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49001, 80);
+        let pkt2 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49002, 80);
+        write_pcap(
+            dir.path(),
+            "capture.pcap",
+            &[
+                (1000, 100_000, pkt0),
+                (1000, 500_000, pkt1),
+                (1000, 900_000, pkt2),
+            ],
+        );
+
+        // Three executions with staggered sub-second windows:
+        //   E0 starts at 1000.0s → window [1000.0, 1002.0)
+        //   E1 starts at 1000.4s → window [1000.4, 1002.4)
+        //   E2 starts at 1000.8s → window [1000.8, 1002.8)
+        // Correct assignment: E0→P0, E1→P1, E2→P2 (capture order).
+        let ip_src = Ipv4Addr::new(10, 0, 0, 2);
+        let ip_dst = Ipv4Addr::new(10, 0, 0, 3);
+        let mut execs = vec![
+            make_execution_us(ip_src, ip_dst, 80, Protocol::Tcp, 1_000_000_000),
+            make_execution_us(ip_src, ip_dst, 80, Protocol::Tcp, 1_000_400_000),
+            make_execution_us(ip_src, ip_dst, 80, Protocol::Tcp, 1_000_800_000),
+        ];
+        enrich_src_ports(dir.path(), &mut execs).unwrap();
+        assert_eq!(execs[0].src_port, 49000);
+        assert_eq!(execs[1].src_port, 49001);
+        assert_eq!(execs[2].src_port, 49002);
+    }
+
+    #[test]
+    fn enrich_same_second_distinct_src_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two same-4-tuple packets at the same second but different microseconds.
+        let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
+        let pkt2 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 50000, 80);
+        write_pcap(
+            dir.path(),
+            "capture.pcap",
+            &[(1000, 100_000, pkt1), (1000, 600_000, pkt2)],
+        );
+
+        let mut execs = vec![
+            make_execution(
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 3),
+                80,
+                Protocol::Tcp,
+                1000,
+            ),
+            make_execution(
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 3),
+                80,
+                Protocol::Tcp,
+                1000,
+            ),
+        ];
+        enrich_src_ports(dir.path(), &mut execs).unwrap();
+        // Each execution must get a distinct src_port — the matched packet is
+        // consumed and cannot be reused.
+        assert_ne!(execs[0].src_port, execs[1].src_port);
+        assert!(execs[0].src_port == 49152 || execs[0].src_port == 50000);
+        assert!(execs[1].src_port == 49152 || execs[1].src_port == 50000);
     }
 }
