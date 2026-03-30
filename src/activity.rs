@@ -6,6 +6,7 @@ use bollard::Docker;
 use bollard::exec::CreateExecOptions;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use tokio::task::JoinSet;
 
 use crate::scenario::{Activities, Phase, Protocol, parse_duration};
 
@@ -33,7 +34,7 @@ pub(crate) struct AttackDetail {
     pub(crate) tool: String,
 }
 
-/// A unified, schedule-ordered activity ready for execution.
+/// A unified activity ready for execution.
 struct Scheduled<'a> {
     offset: chrono::Duration,
     source: &'a str,
@@ -50,11 +51,14 @@ struct AttackRef<'a> {
     tool: &'a str,
 }
 
-/// Executes all activities in schedule order and returns execution results.
+/// Executes all activities concurrently and returns execution results.
 ///
-/// Activities are sorted by `start_offset` and each command is executed
-/// inside the source host's container via Docker exec. Tool packages
-/// (curl, nmap) are installed before the first activity runs.
+/// Each activity is spawned as an independent task that sleeps until its
+/// `start_offset` elapses, then executes the command inside the source
+/// host's container via Docker exec.  This ensures activities with the
+/// same offset (or whose offset has already passed) start without waiting
+/// for earlier commands to finish.  Tool packages (curl, nmap) are
+/// installed before any activity runs.
 pub(crate) async fn run(
     docker: &Docker,
     host_containers: &[(String, String)],
@@ -73,48 +77,70 @@ pub(crate) async fn run(
     let mut schedule = build_schedule(activities)?;
     schedule.sort_unstable_by_key(|s| s.offset);
 
-    let mut results = Vec::with_capacity(schedule.len());
+    // Resolve IPs and container IDs upfront so errors surface early.
+    let prepared: Vec<_> = schedule
+        .iter()
+        .map(|a| {
+            let src_ip = lookup_ip(host_ips, a.source)?;
+            let dst_ip = lookup_ip(host_ips, a.target)?;
+            let command = a.command.replace("${target_ip}", &dst_ip.to_string());
+            let container_id = lookup_container(host_containers, a.source)?;
+            Ok((a, src_ip, dst_ip, command, container_id.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    for activity in &schedule {
-        wait_until(generation_start + activity.offset).await;
+    // Spawn each activity as an independent task. Each task sleeps
+    // until its scheduled offset, then executes the command.  This
+    // ensures activities whose offsets have already elapsed (or share
+    // the same offset) start without waiting for earlier execs.
+    let mut tasks = JoinSet::new();
+    for (activity, src_ip, dst_ip, command, container_id) in prepared {
+        let docker = docker.clone();
+        let target_time = generation_start + activity.offset;
+        let source = activity.source.to_owned();
+        let target = activity.target.to_owned();
+        let protocol = activity.protocol;
+        let dst_port = activity.dst_port;
+        let attack = activity.attack.as_ref().map(|a| AttackDetail {
+            technique: a.technique.to_owned(),
+            phase: a.phase,
+            tool: a.tool.to_owned(),
+        });
 
-        let src_ip = lookup_ip(host_ips, activity.source)?;
-        let dst_ip = lookup_ip(host_ips, activity.target)?;
-        let command = activity
-            .command
-            .replace("${target_ip}", &dst_ip.to_string());
-        let container_id = lookup_container(host_containers, activity.source)?;
+        tasks.spawn(async move {
+            wait_until(target_time).await;
 
-        println!("  Executing: {command}");
-        let start = Utc::now();
-        let code = exec_in_container(docker, container_id, &command)
-            .await
-            .with_context(|| format!("activity exec failed in '{}'", activity.source))?;
-        let end = Utc::now();
+            println!("  Executing: {command}");
+            let start = Utc::now();
+            let code = exec_in_container(&docker, &container_id, &command)
+                .await
+                .with_context(|| format!("activity exec failed in '{source}'"))?;
+            let end = Utc::now();
 
-        // Non-zero is expected for some activities (e.g. curl against a
-        // host with no web server), so we warn rather than fail.
-        if code != 0 {
-            eprintln!("  Warning: command exited with code {code}: {command}");
-        }
+            if code != 0 {
+                eprintln!("  Warning: command exited with code {code}: {command}");
+            }
 
-        results.push(Execution {
-            start,
-            end,
-            source: activity.source.to_owned(),
-            target: activity.target.to_owned(),
-            protocol: activity.protocol,
-            src_ip,
-            src_port: 0,
-            dst_ip,
-            dst_port: activity.dst_port,
-            attack: activity.attack.as_ref().map(|a| AttackDetail {
-                technique: a.technique.to_owned(),
-                phase: a.phase,
-                tool: a.tool.to_owned(),
-            }),
+            Ok::<Execution, anyhow::Error>(Execution {
+                start,
+                end,
+                source,
+                target,
+                protocol,
+                src_ip,
+                src_port: 0,
+                dst_ip,
+                dst_port,
+                attack,
+            })
         });
     }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    while let Some(outcome) = tasks.join_next().await {
+        results.push(outcome.context("activity task panicked")??);
+    }
+    results.sort_by_key(|e| e.start);
 
     // Brief pause so trailing packets are captured by tcpdump.
     tokio::time::sleep(std::time::Duration::from_secs(CAPTURE_DRAIN_SECS)).await;
@@ -605,9 +631,17 @@ mod tests {
         let expected_src = expected_ips[0].1;
         let expected_dst = expected_ips[1].1;
 
-        // First result (normal — lower offset 30s).
-        let normal = &results[0];
-        assert!(normal.attack.is_none());
+        // Find results by type (concurrent execution means order by
+        // start time is non-deterministic when offsets already elapsed).
+        let normal = results
+            .iter()
+            .find(|e| e.attack.is_none())
+            .expect("expected a normal execution");
+        let attack = results
+            .iter()
+            .find(|e| e.attack.is_some())
+            .expect("expected an attack execution");
+
         assert_eq!(normal.source, "attacker-001");
         assert_eq!(normal.target, "target-001");
         assert_eq!(normal.protocol, Protocol::Tcp);
@@ -626,9 +660,7 @@ mod tests {
             "end must be actual (before test ended)"
         );
 
-        // Second result (attack — higher offset 120s).
-        let attack = &results[1];
-        let detail = attack.attack.as_ref().expect("should be an attack");
+        let detail = attack.attack.as_ref().unwrap();
         assert_eq!(detail.technique, "T1046");
         assert_eq!(detail.phase, Phase::Reconnaissance);
         assert_eq!(detail.tool, "nmap");
@@ -643,12 +675,6 @@ mod tests {
         assert!(
             attack.end <= after,
             "end must be actual (before test ended)"
-        );
-
-        // Normal must have run before attack (schedule order).
-        assert!(
-            normal.end <= attack.start,
-            "normal should complete before attack starts",
         );
 
         // target-001 is never a source, so it should not have tools.
@@ -690,6 +716,9 @@ mod tests {
         .await
         .unwrap();
 
+        // Stop collectors so pcap files are flushed to disk.
+        env.stop_collectors().await.unwrap();
+
         crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
         crate::ground_truth::write(dir.path(), &results).unwrap();
 
@@ -699,24 +728,36 @@ mod tests {
         let target_ip = expected_ips[1].1.to_string();
 
         let content = std::fs::read_to_string(gt_dir.join("manifest.jsonl")).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+
+        // Find records by label (concurrent execution means start-time
+        // order is non-deterministic when offsets already elapsed).
+        let normal = records
+            .iter()
+            .find(|r| r["label"] == "normal")
+            .expect("expected a normal record");
+        let anomaly = records
+            .iter()
+            .find(|r| r["label"] == "anomaly")
+            .expect("expected an anomaly record");
 
         // Verify normal record.
-        let r0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(r0["scope"], "session");
-        assert_eq!(r0["label"], "normal");
-        assert_eq!(r0["session_type"], "network");
-        assert_eq!(r0["protocol"], "tcp");
-        assert_eq!(r0["src_ip"], attacker_ip);
-        assert!(r0["src_port"].is_number(), "src_port must be present");
-        assert_eq!(r0["dst_ip"], target_ip);
-        assert_eq!(r0["dst_port"], 80);
-        assert!(r0.get("category").is_none());
-        assert!(r0.get("technique").is_none());
+        assert_eq!(normal["scope"], "session");
+        assert_eq!(normal["session_type"], "network");
+        assert_eq!(normal["protocol"], "tcp");
+        assert_eq!(normal["src_ip"], attacker_ip);
+        assert!(normal["src_port"].is_number(), "src_port must be present");
+        assert_eq!(normal["dst_ip"], target_ip);
+        assert_eq!(normal["dst_port"], 80);
+        assert!(normal.get("category").is_none());
+        assert!(normal.get("technique").is_none());
 
         // Timestamps are actual wall-clock times, not offset-derived.
-        let start_str = r0["start"].as_str().unwrap();
+        let start_str = normal["start"].as_str().unwrap();
         let start_ts = chrono::DateTime::parse_from_rfc3339(start_str).unwrap();
         assert!(
             start_ts >= before,
@@ -724,26 +765,17 @@ mod tests {
         );
 
         // Verify anomaly record.
-        let r1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(r1["scope"], "session");
-        assert_eq!(r1["label"], "anomaly");
-        assert_eq!(r1["category"], "attack");
-        assert_eq!(r1["technique"], "T1046");
-        assert_eq!(r1["phase"], "reconnaissance");
-        assert_eq!(r1["tool"], "nmap");
-        assert_eq!(r1["src_ip"], attacker_ip);
+        assert_eq!(anomaly["scope"], "session");
+        assert_eq!(anomaly["category"], "attack");
+        assert_eq!(anomaly["technique"], "T1046");
+        assert_eq!(anomaly["phase"], "reconnaissance");
+        assert_eq!(anomaly["tool"], "nmap");
+        assert_eq!(anomaly["src_ip"], attacker_ip);
         assert!(
-            r1["src_port"].is_number(),
+            anomaly["src_port"].is_number(),
             "attack src_port must be present"
         );
-        assert_eq!(r1["dst_ip"], target_ip);
-
-        let attack_start_str = r1["start"].as_str().unwrap();
-        let attack_start_ts = chrono::DateTime::parse_from_rfc3339(attack_start_str).unwrap();
-        assert!(
-            attack_start_ts >= start_ts,
-            "attack should start after normal",
-        );
+        assert_eq!(anomaly["dst_ip"], target_ip);
 
         env.down().await.unwrap();
     }
@@ -779,8 +811,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), 2, "expected 1 normal + 1 attack execution");
-        assert_eq!(results[0].source, "attacker-alpine");
-        assert_eq!(results[1].source, "attacker-alpine");
+        assert!(
+            results.iter().all(|e| e.source == "attacker-alpine"),
+            "both activities should run from attacker-alpine",
+        );
 
         // The Alpine attacker should now have curl and nmap.
         let attacker_id = lookup_container(&env.host_containers, "attacker-alpine").unwrap();
@@ -885,8 +919,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].source, "attacker-alpine");
-        assert_eq!(results[1].source, "target-ubuntu");
+
+        let normal = results.iter().find(|e| e.attack.is_none()).unwrap();
+        let attack = results.iter().find(|e| e.attack.is_some()).unwrap();
+        assert_eq!(normal.source, "attacker-alpine");
+        assert_eq!(attack.source, "target-ubuntu");
 
         // Both sources should have tools.
         let alpine_id = lookup_container(&env.host_containers, "attacker-alpine").unwrap();
@@ -944,6 +981,210 @@ mod tests {
         install_tools(&env.docker, &source_containers)
             .await
             .unwrap();
+
+        env.down().await.unwrap();
+    }
+
+    // ── Concurrency E2E tests ────────────────────────────────────
+
+    /// Two activities with the same `start_offset` must begin within 1 second
+    /// of each other, proving they are launched concurrently rather than
+    /// sequentially.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn same_offset_activities_start_within_one_second() {
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
+
+        // Give both activities the same offset so they should start
+        // at the same time.
+        scenario.activities.normal[0].start_offset = "10s".to_owned();
+        scenario.activities.attack[0].start_offset = "10s".to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        // Use a past start so the shared offset is already elapsed.
+        let past_start = Utc::now() - chrono::Duration::try_hours(1).unwrap();
+        let results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            past_start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        let gap = (results[1].start - results[0].start).abs();
+        assert!(
+            gap < chrono::Duration::try_seconds(1).unwrap(),
+            "same-offset activities should start within 1s, but gap was {gap}",
+        );
+
+        env.down().await.unwrap();
+    }
+
+    /// Full pipeline (run → pcap enrichment → ground truth) with
+    /// same-offset activities that execute concurrently.  Verifies
+    /// that pcap matching and ground-truth recording produce correct
+    /// output even when execution time windows overlap.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn concurrent_activities_produce_valid_ground_truth() {
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
+
+        // Same offset so both activities run concurrently.
+        scenario.activities.normal[0].start_offset = "10s".to_owned();
+        scenario.activities.attack[0].start_offset = "10s".to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        let gt_dir = dir.path().join("ground_truth");
+        std::fs::create_dir_all(&net_dir).unwrap();
+        std::fs::create_dir_all(&gt_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let before = Utc::now();
+        let past_start = before - chrono::Duration::try_hours(1).unwrap();
+        let mut results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            past_start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        // Stop collectors so pcap files are flushed to disk.
+        env.stop_collectors().await.unwrap();
+
+        crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
+
+        // Both executions must have distinct, non-zero src_ports even
+        // though they share the same src_ip, dst_ip, and dst_port.
+        let normal = results.iter().find(|e| e.attack.is_none()).unwrap();
+        let attack = results.iter().find(|e| e.attack.is_some()).unwrap();
+        assert_ne!(normal.src_port, 0, "normal src_port must be enriched");
+        assert_ne!(attack.src_port, 0, "attack src_port must be enriched");
+
+        crate::ground_truth::write(dir.path(), &results).unwrap();
+
+        let content = std::fs::read_to_string(gt_dir.join("manifest.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+
+        let gt_normal = records
+            .iter()
+            .find(|r| r["label"] == "normal")
+            .expect("expected a normal record");
+        let gt_anomaly = records
+            .iter()
+            .find(|r| r["label"] == "anomaly")
+            .expect("expected an anomaly record");
+
+        // Normal record fields.
+        assert_eq!(gt_normal["scope"], "session");
+        assert_eq!(gt_normal["protocol"], "tcp");
+        assert!(gt_normal["src_port"].is_number());
+        assert_eq!(gt_normal["dst_port"], 80);
+        assert!(gt_normal.get("technique").is_none());
+
+        // Anomaly record fields.
+        assert_eq!(gt_anomaly["scope"], "session");
+        assert_eq!(gt_anomaly["label"], "anomaly");
+        assert_eq!(gt_anomaly["technique"], "T1046");
+        assert!(gt_anomaly["src_port"].is_number());
+
+        env.down().await.unwrap();
+    }
+
+    /// A long-running activity must not delay a later-offset activity.
+    /// Activity A sleeps 4 seconds at offset 0; activity B runs at
+    /// offset 2s.  With sequential execution, B would start at ≥4s;
+    /// with concurrent execution, B should start near 2s.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn long_activity_does_not_delay_later_offset() {
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
+
+        // Activity A: slow command at offset 0.
+        scenario.activities.normal[0].command = "sleep 4".to_owned();
+        scenario.activities.normal[0].start_offset = "0s".to_owned();
+
+        // Activity B: fast command at offset 2s.
+        scenario.activities.attack[0].command = "echo done".to_owned();
+        scenario.activities.attack[0].start_offset = "2s".to_owned();
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = crate::infra::ProvisionedEnv::up(&scenario, &net_dir)
+            .await
+            .unwrap();
+
+        let start = Utc::now();
+        let results = run(
+            &env.docker,
+            &env.host_containers,
+            &env.host_ips,
+            &scenario.activities,
+            start,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        // Find activity B (the "echo done" one that starts at offset 2s).
+        let b = results
+            .iter()
+            .find(|e| e.attack.is_some())
+            .expect("attack activity should be present");
+
+        // B should start around 2s after generation start, not ≥4s.
+        let b_delay = b.start - start;
+        assert!(
+            b_delay < chrono::Duration::try_seconds(4).unwrap(),
+            "activity B should start before the slow activity A finishes, \
+             but it started {b_delay} after generation start",
+        );
+
+        // Activity A (sleep 4) should take at least 3s.
+        let a = results
+            .iter()
+            .find(|e| e.attack.is_none())
+            .expect("normal activity should be present");
+        let a_duration = a.end - a.start;
+        assert!(
+            a_duration >= chrono::Duration::try_seconds(3).unwrap(),
+            "slow activity should have taken ≥3s, but took {a_duration}",
+        );
+
+        // B should have started before A finished (concurrent proof).
+        assert!(
+            b.start < a.end,
+            "activity B should start before activity A finishes",
+        );
 
         env.down().await.unwrap();
     }
