@@ -87,20 +87,20 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
         scenario.infrastructure.network.segments.len(),
     );
 
-    // Execute activities and write outputs; always tear down afterward.
+    // Run activities, then assemble the bundle; always tear down afterward.
     println!("Running activities…");
-    let run_result = run_and_record(&env, &scenario, scenario_path, output_dir, start).await;
+    let result = run_and_assemble(&env, &scenario, scenario_path, output_dir, start).await;
 
     let teardown_result = env.down().await;
-    run_result?;
+    result?;
     teardown_result?;
     println!("Infrastructure torn down");
 
     Ok(())
 }
 
-/// Runs activities, writes ground truth, and writes metadata.
-async fn run_and_record(
+/// Executes activities, stops collectors, and assembles the output bundle.
+async fn run_and_assemble(
     env: &infra::ProvisionedEnv,
     scenario: &scenario::Scenario,
     scenario_path: &str,
@@ -117,24 +117,47 @@ async fn run_and_record(
     .await?;
     println!("Executed {} activity(ies)", executions.len());
 
+    // Stop capture containers so pcap files are flushed and complete.
+    env.stop_collectors().await?;
+    println!("Stopped collectors");
+
+    // Assemble the bundle: enrich executions from pcap, write ground
+    // truth, and write metadata.
+    assemble_bundle(
+        output_dir,
+        scenario_path,
+        scenario,
+        &env.host_ips,
+        start,
+        &mut executions,
+    )
+}
+
+/// Assembles the dataset bundle from collected artifacts.
+///
+/// Reads pcap captures to enrich execution records with source ports,
+/// then writes `ground_truth/manifest.jsonl` and `meta.json` into
+/// the output directory.
+fn assemble_bundle(
+    output_dir: &Path,
+    scenario_path: &str,
+    scenario: &scenario::Scenario,
+    host_ips: &[(String, Vec<std::net::Ipv4Addr>)],
+    start: chrono::DateTime<chrono::Utc>,
+    executions: &mut [activity::Execution],
+) -> Result<()> {
     let net_dir = output_dir.join("net");
-    pcap::enrich_src_ports(&net_dir, &mut executions)?;
+    pcap::enrich_src_ports(&net_dir, executions)?;
     println!("Enriched source ports from pcap");
 
-    ground_truth::write(output_dir, &executions)?;
+    ground_truth::write(output_dir, executions)?;
     println!("Wrote ground_truth/manifest.jsonl");
 
     let scenario_filename = Path::new(scenario_path).file_name().map_or_else(
         || scenario_path.to_owned(),
         |n| n.to_string_lossy().into_owned(),
     );
-    meta::write(
-        output_dir,
-        &scenario_filename,
-        scenario,
-        &env.host_ips,
-        start,
-    )?;
+    meta::write(output_dir, &scenario_filename, scenario, host_ips, start)?;
     println!("Wrote meta.json");
 
     Ok(())
@@ -168,6 +191,236 @@ mod tests {
             .join("ac-0.scenario.yaml");
         scenario::load(&path).unwrap()
     }
+
+    // ── assemble_bundle ────────────────────────────────────────
+
+    /// Builds a synthetic pcap with one or more TCP packets.
+    fn write_synthetic_pcap(dir: &Path, name: &str, packets: &[(u32, u16)]) {
+        let mut data = Vec::new();
+        // Global header (little-endian magic).
+        data.extend_from_slice(&0xa1b2_c3d4_u32.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&65535u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        for &(ts, src_port) in packets {
+            // Packet: Ethernet + IPv4 + TCP
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(&[0u8; 12]); // MACs
+            pkt.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType IPv4
+            pkt.push(0x45); // IPv4, IHL=5
+            pkt.push(0);
+            pkt.extend_from_slice(&40u16.to_be_bytes());
+            pkt.extend_from_slice(&[0; 4]);
+            pkt.push(64);
+            pkt.push(6); // TCP
+            pkt.extend_from_slice(&[0; 2]);
+            pkt.extend_from_slice(&[10, 100, 0, 2]); // src_ip
+            pkt.extend_from_slice(&[10, 100, 0, 3]); // dst_ip
+            pkt.extend_from_slice(&src_port.to_be_bytes());
+            pkt.extend_from_slice(&80u16.to_be_bytes());
+            pkt.extend_from_slice(&[0; 16]);
+            // Packet record header.
+            let pkt_len = u32::try_from(pkt.len()).unwrap();
+            data.extend_from_slice(&ts.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&pkt_len.to_le_bytes());
+            data.extend_from_slice(&pkt_len.to_le_bytes());
+            data.extend(pkt);
+        }
+        fs::write(dir.join(name), data).unwrap();
+    }
+
+    fn ac0_host_ips() -> Vec<(String, Vec<std::net::Ipv4Addr>)> {
+        vec![
+            (
+                "attacker-001".into(),
+                vec![std::net::Ipv4Addr::new(10, 100, 0, 2)],
+            ),
+            (
+                "target-001".into(),
+                vec![std::net::Ipv4Addr::new(10, 100, 0, 3)],
+            ),
+        ]
+    }
+
+    fn make_execution(ts: i64, attack: Option<activity::AttackDetail>) -> activity::Execution {
+        let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
+        activity::Execution {
+            start,
+            end: start + chrono::Duration::try_seconds(1).unwrap(),
+            source: "attacker-001".into(),
+            target: "target-001".into(),
+            protocol: scenario::Protocol::Tcp,
+            src_ip: std::net::Ipv4Addr::new(10, 100, 0, 2),
+            src_port: 0,
+            dst_ip: std::net::Ipv4Addr::new(10, 100, 0, 3),
+            dst_port: 80,
+            attack,
+        }
+    }
+
+    #[test]
+    fn assemble_bundle_writes_gt_and_meta() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        create_output_dirs(dir.path(), &scenario).unwrap();
+
+        let ts: i64 = 1_737_000_030;
+        write_synthetic_pcap(
+            &dir.path().join("net"),
+            "capture-lan.pcap",
+            &[(u32::try_from(ts).unwrap(), 49152)],
+        );
+
+        let host_ips = ac0_host_ips();
+        let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
+        let mut executions = vec![make_execution(ts, None)];
+
+        assemble_bundle(
+            dir.path(),
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            start,
+            &mut executions,
+        )
+        .unwrap();
+
+        // src_port should be enriched from pcap.
+        assert_eq!(executions[0].src_port, 49152);
+
+        // ground_truth/manifest.jsonl must exist with one record.
+        let gt = fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(gt.trim()).unwrap();
+        assert_eq!(record["label"], "normal");
+        assert_eq!(record["src_port"], 49152);
+
+        // meta.json must exist and be valid.
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["schema_version"], "1");
+        assert_eq!(meta["hosts"][0]["name"], "attacker-001");
+    }
+
+    #[test]
+    fn assemble_bundle_writes_attack_record() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        create_output_dirs(dir.path(), &scenario).unwrap();
+
+        let ts: i64 = 1_737_000_120;
+        write_synthetic_pcap(
+            &dir.path().join("net"),
+            "capture-lan.pcap",
+            &[(u32::try_from(ts).unwrap(), 50000)],
+        );
+
+        let host_ips = ac0_host_ips();
+        let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
+        let mut executions = vec![make_execution(
+            ts,
+            Some(activity::AttackDetail {
+                technique: "T1046".into(),
+                phase: scenario::Phase::Reconnaissance,
+                tool: "nmap".into(),
+            }),
+        )];
+
+        assemble_bundle(
+            dir.path(),
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            start,
+            &mut executions,
+        )
+        .unwrap();
+
+        let gt = fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(gt.trim()).unwrap();
+        assert_eq!(record["label"], "anomaly");
+        assert_eq!(record["category"], "attack");
+        assert_eq!(record["technique"], "T1046");
+        assert_eq!(record["phase"], "reconnaissance");
+        assert_eq!(record["tool"], "nmap");
+        assert_eq!(record["src_port"], 50000);
+    }
+
+    #[test]
+    fn assemble_bundle_mixed_normal_and_attack() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        create_output_dirs(dir.path(), &scenario).unwrap();
+
+        let ts_normal: i64 = 1_737_000_030;
+        let ts_attack: i64 = 1_737_000_120;
+        write_synthetic_pcap(
+            &dir.path().join("net"),
+            "capture-lan.pcap",
+            &[
+                (u32::try_from(ts_normal).unwrap(), 49152),
+                (u32::try_from(ts_attack).unwrap(), 50000),
+            ],
+        );
+
+        let host_ips = ac0_host_ips();
+        let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts_normal, 0).unwrap();
+        let mut executions = vec![
+            make_execution(ts_normal, None),
+            make_execution(
+                ts_attack,
+                Some(activity::AttackDetail {
+                    technique: "T1046".into(),
+                    phase: scenario::Phase::Reconnaissance,
+                    tool: "nmap".into(),
+                }),
+            ),
+        ];
+
+        assemble_bundle(
+            dir.path(),
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            start,
+            &mut executions,
+        )
+        .unwrap();
+
+        // Both src_ports enriched.
+        assert_eq!(executions[0].src_port, 49152);
+        assert_eq!(executions[1].src_port, 50000);
+
+        // Two JSONL records in correct order.
+        let gt = fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap();
+        let lines: Vec<&str> = gt.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let r0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let r1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r0["label"], "normal");
+        assert_eq!(r0["src_port"], 49152);
+        assert_eq!(r1["label"], "anomaly");
+        assert_eq!(r1["src_port"], 50000);
+
+        // Records sorted by start time.
+        assert!(
+            r0["start"].as_str().unwrap() < r1["start"].as_str().unwrap(),
+            "records must be sorted by start time",
+        );
+
+        // meta.json written with both hosts.
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["hosts"].as_array().unwrap().len(), 2);
+    }
+
+    // ── create_output_dirs ───────────────────────────────────────
 
     #[test]
     fn create_output_dirs_creates_expected_structure() {
@@ -208,43 +461,86 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify directory structure.
+        // ── Bundle directory structure ────────────────────────────
         assert!(dir.path().join("net").is_dir());
         assert!(dir.path().join("ground_truth").is_dir());
         assert!(dir.path().join("host/attacker-001").is_dir());
         assert!(dir.path().join("host/target-001").is_dir());
 
-        // Verify meta.json exists and contains correct IPs.
+        // ── PCAP present and non-empty ───────────────────────────
+        let pcap_path = dir.path().join("net/capture-lan.pcap");
+        assert!(pcap_path.exists(), "pcap file was not created");
+        let pcap_len = fs::metadata(&pcap_path).unwrap().len();
+        assert!(pcap_len > 24, "pcap must be larger than the global header");
+
+        // ── meta.json ────────────────────────────────────────────
         let meta_path = dir.path().join("meta.json");
         assert!(meta_path.exists(), "meta.json was not created");
         let meta_content = fs::read_to_string(&meta_path).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
         assert_eq!(meta["schema_version"], "1");
+        assert_eq!(meta["scenario"], "ac-0.scenario.yaml");
+        assert_eq!(meta["duration"]["total"], "5m");
         assert_eq!(meta["hosts"][0]["name"], "attacker-001");
         assert_eq!(meta["hosts"][0]["ips"][0], "10.100.0.2");
         assert_eq!(meta["hosts"][1]["name"], "target-001");
         assert_eq!(meta["hosts"][1]["ips"][0], "10.100.0.3");
+        assert_eq!(meta["network"]["segments"][0]["name"], "lan");
         assert_eq!(meta["network"]["segments"][0]["subnet"], "10.100.0.0/24");
+        assert_eq!(meta["capture"]["pcaps"][0]["segment"], "lan");
+        assert_eq!(meta["capture"]["pcaps"][0]["path"], "net/capture-lan.pcap",);
 
-        // Verify ground truth manifest.
+        // ── ground_truth/manifest.jsonl ──────────────────────────
         let gt_path = dir.path().join("ground_truth/manifest.jsonl");
         assert!(gt_path.exists(), "manifest.jsonl was not created");
         let gt_content = fs::read_to_string(&gt_path).unwrap();
         let lines: Vec<&str> = gt_content.lines().collect();
         assert_eq!(lines.len(), 2, "expected 1 normal + 1 attack record");
 
+        // Normal record — all v1 required fields.
         let r0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(r0["scope"], "session");
         assert_eq!(r0["label"], "normal");
         assert_eq!(r0["source"], "attacker-001");
         assert_eq!(r0["target"], "target-001");
+        assert_eq!(r0["session_type"], "network");
         assert_eq!(r0["protocol"], "tcp");
+        assert_eq!(r0["src_ip"], "10.100.0.2");
+        assert!(
+            r0["src_port"].as_u64().unwrap() > 0,
+            "src_port must be enriched"
+        );
+        assert_eq!(r0["dst_ip"], "10.100.0.3");
         assert_eq!(r0["dst_port"], 80);
+        assert!(
+            r0.get("category").is_none(),
+            "normal record must omit category"
+        );
 
+        // Anomaly record — all v1 required fields including attack fields.
         let r1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r1["scope"], "session");
         assert_eq!(r1["label"], "anomaly");
+        assert_eq!(r1["source"], "attacker-001");
+        assert_eq!(r1["target"], "target-001");
+        assert_eq!(r1["session_type"], "network");
+        assert_eq!(r1["protocol"], "tcp");
+        assert_eq!(r1["src_ip"], "10.100.0.2");
+        assert!(
+            r1["src_port"].as_u64().unwrap() > 0,
+            "src_port must be enriched"
+        );
+        assert_eq!(r1["dst_ip"], "10.100.0.3");
+        assert_eq!(r1["dst_port"], 80);
         assert_eq!(r1["category"], "attack");
         assert_eq!(r1["technique"], "T1046");
         assert_eq!(r1["phase"], "reconnaissance");
         assert_eq!(r1["tool"], "nmap");
+
+        // Records must be sorted by start time.
+        assert!(
+            r0["start"].as_str().unwrap() < r1["start"].as_str().unwrap(),
+            "records must be sorted by start time",
+        );
     }
 }

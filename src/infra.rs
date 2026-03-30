@@ -27,6 +27,7 @@ pub(crate) struct ProvisionedEnv {
     pub(crate) docker: Docker,
     network_ids: Vec<String>,
     container_ids: Vec<String>,
+    capture_container_ids: Vec<String>,
     pub(crate) host_ips: Vec<(String, Vec<Ipv4Addr>)>,
     pub(crate) host_containers: Vec<(String, String)>,
 }
@@ -112,6 +113,7 @@ impl ProvisionedEnv {
             docker,
             network_ids: Vec::new(),
             container_ids: Vec::new(),
+            capture_container_ids: Vec::new(),
             host_ips: Vec::new(),
             host_containers: Vec::new(),
         };
@@ -123,6 +125,18 @@ impl ProvisionedEnv {
         }
 
         Ok(env)
+    }
+
+    /// Gracefully stops all capture (tcpdump) containers so their pcap
+    /// files are flushed and complete before being read.
+    pub(crate) async fn stop_collectors(&self) -> Result<()> {
+        for id in &self.capture_container_ids {
+            self.docker
+                .stop_container(id, None)
+                .await
+                .with_context(|| format!("failed to stop capture container '{id}'"))?;
+        }
+        Ok(())
     }
 
     /// Tears down all provisioned Docker resources.
@@ -220,7 +234,8 @@ impl ProvisionedEnv {
                 .start_container::<String>(&capture_id, None)
                 .await
                 .context("failed to start capture container")?;
-            self.container_ids.push(capture_id);
+            self.container_ids.push(capture_id.clone());
+            self.capture_container_ids.push(capture_id);
         }
 
         Ok(())
@@ -571,6 +586,23 @@ mod tests {
             "container ID must be non-empty"
         );
 
+        // capture_container_ids must track one capture container per segment.
+        assert_eq!(
+            env.capture_container_ids.len(),
+            1,
+            "ac-0 has one segment, so one capture container",
+        );
+        assert!(
+            !env.capture_container_ids[0].is_empty(),
+            "capture container ID must be non-empty",
+        );
+        // Capture containers must also be in the general container list
+        // so they are cleaned up during teardown.
+        assert!(
+            env.container_ids.contains(&env.capture_container_ids[0]),
+            "capture container must be in container_ids for teardown",
+        );
+
         env.down().await.unwrap();
     }
 
@@ -616,6 +648,66 @@ mod tests {
         } else {
             panic!("expected attached exec output");
         }
+
+        env.down().await.unwrap();
+    }
+
+    /// Verifies `stop_collectors` stops capture containers while host
+    /// containers remain running — requires Docker.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn stop_collectors_stops_capture_containers() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = ProvisionedEnv::up(&scenario, &net_dir).await.unwrap();
+        assert_eq!(
+            env.capture_container_ids.len(),
+            1,
+            "ac-0 has one segment, so one capture container",
+        );
+
+        // Wait briefly for tcpdump to start writing.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        env.stop_collectors().await.unwrap();
+
+        // Capture container should be stopped (exited).
+        let info = env
+            .docker
+            .inspect_container(&env.capture_container_ids[0], None)
+            .await
+            .unwrap();
+        let state = info.state.unwrap().status.unwrap();
+        assert_eq!(
+            state,
+            bollard::models::ContainerStateStatusEnum::EXITED,
+            "capture container should be exited after stop_collectors",
+        );
+
+        // Host containers should still be running.
+        for (_, container_id) in &env.host_containers {
+            let info = env
+                .docker
+                .inspect_container(container_id, None)
+                .await
+                .unwrap();
+            let state = info.state.unwrap().status.unwrap();
+            assert_eq!(
+                state,
+                bollard::models::ContainerStateStatusEnum::RUNNING,
+                "host container should still be running",
+            );
+        }
+
+        // Pcap file should exist on disk.
+        let pcap_path = net_dir.join("capture-lan.pcap");
+        assert!(
+            pcap_path.exists(),
+            "pcap file should exist after stopping collectors",
+        );
 
         env.down().await.unwrap();
     }
