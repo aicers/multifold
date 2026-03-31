@@ -50,16 +50,16 @@ pub(crate) fn enrich_src_ports(net_dir: &Path, executions: &mut [Execution]) -> 
     Ok(())
 }
 
-struct Packet {
-    ts_us: i64,
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    protocol: Protocol,
-    src_port: u16,
-    dst_port: u16,
+pub(crate) struct Packet {
+    pub(crate) ts_us: i64,
+    pub(crate) src_ip: Ipv4Addr,
+    pub(crate) dst_ip: Ipv4Addr,
+    pub(crate) protocol: Protocol,
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
 }
 
-fn read_all_packets(net_dir: &Path) -> Result<Vec<Packet>> {
+pub(crate) fn read_all_packets(net_dir: &Path) -> Result<Vec<Packet>> {
     let mut packets = Vec::new();
     for entry in std::fs::read_dir(net_dir)
         .with_context(|| format!("failed to read net dir: {}", net_dir.display()))?
