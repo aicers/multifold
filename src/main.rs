@@ -14,6 +14,7 @@ mod pcap;
 mod scenario;
 #[cfg(test)]
 mod test_util;
+mod validator;
 
 #[derive(Parser)]
 #[command(
@@ -51,12 +52,14 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Generate { scenario, output } => generate(&scenario, &output).await,
+        Command::Generate { scenario, output } => generate(&scenario, &output)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         Command::Validate { bundle } => validate(&bundle),
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
             ExitCode::FAILURE
@@ -177,10 +180,12 @@ fn create_output_dirs(output_dir: &Path, scenario: &scenario::Scenario) -> Resul
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn validate(bundle: &str) -> Result<()> {
-    println!("validate: bundle={bundle}");
-    Ok(())
+fn validate(bundle: &str) -> Result<ExitCode> {
+    let report = validator::run(Path::new(bundle))?;
+    let json =
+        serde_json::to_string_pretty(&report).context("failed to serialize validation report")?;
+    println!("{json}");
+    Ok(report.exit_code())
 }
 
 #[cfg(test)]
@@ -561,5 +566,39 @@ mod tests {
         assert_eq!(anomaly["technique"], "T1046");
         assert_eq!(anomaly["phase"], "reconnaissance");
         assert_eq!(anomaly["tool"], "nmap");
+    }
+
+    /// Generates AC-0 and validates the resulting bundle.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn generated_ac0_bundle_passes_validator() {
+        let subnet = test_util::unique_subnet();
+        let original = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scenarios")
+                .join("ac-0.scenario.yaml"),
+        )
+        .unwrap();
+        let modified = original.replace("10.100.0.0/24", &subnet);
+
+        let dir = tempfile::tempdir().unwrap();
+        let scenario_path = dir.path().join("ac-0.scenario.yaml");
+        fs::write(&scenario_path, &modified).unwrap();
+
+        let output_dir = dir.path().join("output");
+        generate(
+            scenario_path.to_str().unwrap(),
+            output_dir.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let report = validator::run(&output_dir).unwrap();
+        assert!(
+            !report.has_failures(),
+            "generated AC-0 bundle has validation failures: {:#?}",
+            serde_json::to_string_pretty(&report).unwrap(),
+        );
+        assert_eq!(report.exit_code(), ExitCode::SUCCESS);
     }
 }
