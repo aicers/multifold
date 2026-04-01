@@ -110,6 +110,8 @@ mod tests {
             dst_ip: Ipv4Addr::new(10, 100, 0, 3),
             dst_port: 80,
             attack: None,
+            exit_code: 0,
+            command: String::new(),
         }
     }
 
@@ -129,6 +131,8 @@ mod tests {
                 phase: Phase::Reconnaissance,
                 tool: "nmap".to_owned(),
             }),
+            exit_code: 0,
+            command: String::new(),
         }
     }
 

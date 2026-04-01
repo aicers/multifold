@@ -27,6 +27,8 @@ infrastructure:
       os: linux
       role: target
       image: ubuntu:22.04
+      setup:
+        - "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq netcat-openbsd >/dev/null 2>&1 && { while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 80 -q 0 > /dev/null; done & }"
     - name: observer-ubuntu
       os: linux
       role: observer

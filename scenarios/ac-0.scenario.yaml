@@ -26,6 +26,8 @@ infrastructure:
       os: linux
       role: target
       image: alpine:3.19
+      setup:
+        - "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 80 > /dev/null; done &"
   network:
     segments:
       - name: lan

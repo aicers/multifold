@@ -92,9 +92,8 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
         scenario.infrastructure.network.segments.len(),
     );
 
-    // Run activities, then assemble the bundle; always tear down afterward.
-    println!("Running activities…");
-    let result = run_and_assemble(&env, &scenario, scenario_path, output_dir, start).await;
+    // Run setup, activities, then assemble the bundle; always tear down.
+    let result = setup_run_and_assemble(&env, &scenario, scenario_path, output_dir, start).await;
 
     let teardown_result = env.down().await;
     result?;
@@ -104,14 +103,23 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// Executes activities, stops collectors, and assembles the output bundle.
-async fn run_and_assemble(
+/// Runs setup commands, executes activities, stops collectors, and
+/// assembles the output bundle.
+async fn setup_run_and_assemble(
     env: &infra::ProvisionedEnv,
     scenario: &scenario::Scenario,
     scenario_path: &str,
     output_dir: &Path,
     start: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    activity::run_setup(
+        &env.docker,
+        &scenario.infrastructure.hosts,
+        &env.host_containers,
+    )
+    .await?;
+
+    println!("Running activities…");
     let mut executions = activity::run(
         &env.docker,
         &env.host_containers,
@@ -121,6 +129,19 @@ async fn run_and_assemble(
     )
     .await?;
     println!("Executed {} activity(ies)", executions.len());
+
+    // Fail early if any activity command returned a non-zero exit code.
+    let failures: Vec<_> = executions
+        .iter()
+        .filter(|e| e.exit_code != 0)
+        .map(|e| format!("exit code {}: {}", e.exit_code, e.command))
+        .collect();
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} activity command(s) failed:\n  {}",
+        failures.len(),
+        failures.join("\n  "),
+    );
 
     // Stop capture containers so pcap files are flushed and complete.
     env.stop_collectors().await?;
@@ -260,6 +281,8 @@ mod tests {
             dst_ip: std::net::Ipv4Addr::new(10, 100, 0, 3),
             dst_port: 80,
             attack,
+            exit_code: 0,
+            command: String::new(),
         }
     }
 
