@@ -611,17 +611,31 @@ fn validate_l4_lite(bundle: &Path, records: &[Value], checks: &mut Vec<Check>) {
         return;
     }
 
-    for record in &network_records {
-        if matches_any_packet(record, &packets) {
-            checks.push(pass(
-                "L4-001",
-                "at least one GT network session matches a PCAP flow",
-            ));
-            return;
+    let mut unmatched = Vec::new();
+    for (i, record) in network_records.iter().enumerate() {
+        if !matches_any_packet(record, &packets) {
+            unmatched.push(i + 1);
         }
     }
 
-    checks.push(fail("L4-001", "no GT session matches any PCAP flow"));
+    if unmatched.is_empty() {
+        checks.push(pass(
+            "L4-001",
+            format!(
+                "all {} GT network session(s) match a PCAP flow",
+                network_records.len(),
+            ),
+        ));
+    } else {
+        checks.push(fail(
+            "L4-001",
+            format!(
+                "{}/{} GT network session(s) have no matching PCAP flow: records {unmatched:?}",
+                unmatched.len(),
+                network_records.len(),
+            ),
+        ));
+    }
 }
 
 fn matches_any_packet(record: &Value, packets: &[pcap::Packet]) -> bool {
@@ -1105,6 +1119,24 @@ mod tests {
     }
 
     // ── L4 failures ─────────────────────────────────────────
+
+    #[test]
+    fn partial_pcap_match_fails_l4_001() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        // PCAP matches only the normal record (port 80 at 09:00:30Z),
+        // but not the attack record (port 80 at 09:02:00Z).
+        let data = build_pcap(&[PcapFlow {
+            ts: ts_for("2026-01-15T09:00:30Z"),
+            src_ip: [10, 100, 0, 2],
+            dst_ip: [10, 100, 0, 3],
+            src_port: 49152,
+            dst_port: 80,
+        }]);
+        fs::write(dir.path().join("net/capture-lan.pcap"), data).unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-001");
+    }
 
     #[test]
     fn no_matching_pcap_flow_fails_l4_001() {

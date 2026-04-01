@@ -75,6 +75,8 @@ pub(crate) struct Host {
     pub(crate) os: Os,
     pub(crate) role: Role,
     pub(crate) image: String,
+    #[serde(default)]
+    pub(crate) setup: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,12 +400,15 @@ activities:
         assert_eq!(attacker.os, Os::Linux);
         assert_eq!(attacker.role, Role::Attacker);
         assert_eq!(attacker.image, "alpine:3.19");
+        assert!(attacker.setup.is_empty());
 
         let target = &s.infrastructure.hosts[1];
         assert_eq!(target.name, "target-001");
         assert_eq!(target.os, Os::Linux);
         assert_eq!(target.role, Role::Target);
         assert_eq!(target.image, "alpine:3.19");
+        assert_eq!(target.setup.len(), 1);
+        assert!(target.setup[0].contains("nc -l"));
     }
 
     #[test]
@@ -459,6 +464,12 @@ activities:
         assert_eq!(s.infrastructure.hosts.len(), 1);
         assert!(s.activities.normal.is_empty());
         assert!(s.activities.attack.is_empty());
+    }
+
+    #[test]
+    fn setup_defaults_to_empty_when_omitted() {
+        let s: Scenario = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        assert!(s.infrastructure.hosts[0].setup.is_empty());
     }
 
     // ── Duration validation ───────────────────────────────────────

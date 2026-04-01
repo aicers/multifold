@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use tokio::task::JoinSet;
 
-use crate::scenario::{Activities, Phase, Protocol, parse_duration};
+use crate::scenario::{Activities, Host, Phase, Protocol, parse_duration};
 
 /// Seconds to wait after the last activity so trailing packets reach
 /// the tcpdump capture containers.
@@ -26,6 +26,8 @@ pub(crate) struct Execution {
     pub(crate) dst_ip: Ipv4Addr,
     pub(crate) dst_port: u16,
     pub(crate) attack: Option<AttackDetail>,
+    pub(crate) exit_code: i64,
+    pub(crate) command: String,
 }
 
 pub(crate) struct AttackDetail {
@@ -49,6 +51,36 @@ struct AttackRef<'a> {
     technique: &'a str,
     phase: Phase,
     tool: &'a str,
+}
+
+/// Runs per-host setup commands before any activities start.
+///
+/// Each command runs sequentially inside the host's container and must
+/// exit with code 0.  Typical use: start a background service (e.g.
+/// `busybox httpd`) that activities will target.
+pub(crate) async fn run_setup(
+    docker: &Docker,
+    hosts: &[Host],
+    host_containers: &[(String, String)],
+) -> Result<()> {
+    for host in hosts {
+        if host.setup.is_empty() {
+            continue;
+        }
+        let container_id = lookup_container(host_containers, &host.name)?;
+        for cmd in &host.setup {
+            println!("  Setup {}: {cmd}", host.name);
+            let code = exec_in_container(docker, container_id, cmd)
+                .await
+                .with_context(|| format!("setup command failed in '{}'", host.name))?;
+            anyhow::ensure!(
+                code == 0,
+                "setup command failed in '{}' (exit code {code}): {cmd}",
+                host.name,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Executes all activities concurrently and returns execution results.
@@ -112,13 +144,13 @@ pub(crate) async fn run(
 
             println!("  Executing: {command}");
             let start = Utc::now();
-            let code = exec_in_container(&docker, &container_id, &command)
+            let exit_code = exec_in_container(&docker, &container_id, &command)
                 .await
                 .with_context(|| format!("activity exec failed in '{source}'"))?;
             let end = Utc::now();
 
-            if code != 0 {
-                eprintln!("  Warning: command exited with code {code}: {command}");
+            if exit_code != 0 {
+                eprintln!("  Warning: command exited with code {exit_code}: {command}");
             }
 
             Ok::<Execution, anyhow::Error>(Execution {
@@ -132,6 +164,8 @@ pub(crate) async fn run(
                 dst_ip,
                 dst_port,
                 attack,
+                exit_code,
+                command,
             })
         });
     }

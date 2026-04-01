@@ -417,6 +417,8 @@ mod tests {
             dst_port,
             src_port: 0,
             attack: None,
+            exit_code: 0,
+            command: String::new(),
         }
     }
 

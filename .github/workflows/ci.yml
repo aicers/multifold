@@ -58,6 +58,29 @@ jobs:
       - name: Run Tests
         run: cargo test
 
+  ac0-pipeline:
+    name: AC-0 Pipeline
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Generate AC-0 bundle
+        run: cargo run --release -- generate -s scenarios/ac-0.scenario.yaml -o ac0-bundle
+
+      - name: Validate AC-0 bundle
+        run: cargo run --release -- validate -b ac0-bundle
+
   docker-e2e:
     name: Docker E2E
     needs: [check]
