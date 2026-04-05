@@ -46,6 +46,11 @@ enum Command {
         /// Path to the dataset bundle directory.
         #[arg(short, long)]
         bundle: String,
+
+        /// Timestamp tolerance in seconds added to GT record end times
+        /// when matching against PCAP flows and Sysmon events.
+        #[arg(short, long, default_value_t = 1)]
+        tolerance: u32,
     },
 }
 
@@ -57,7 +62,7 @@ async fn main() -> ExitCode {
         Command::Generate { scenario, output } => generate(&scenario, &output)
             .await
             .map(|()| ExitCode::SUCCESS),
-        Command::Validate { bundle } => validate(&bundle),
+        Command::Validate { bundle, tolerance } => validate(&bundle, tolerance),
     };
 
     match result {
@@ -233,8 +238,11 @@ fn create_output_dirs(output_dir: &Path, scenario: &scenario::Scenario) -> Resul
     Ok(())
 }
 
-fn validate(bundle: &str) -> Result<ExitCode> {
-    let report = validator::run(Path::new(bundle))?;
+fn validate(bundle: &str, tolerance_secs: u32) -> Result<ExitCode> {
+    let config = validator::ValidatorConfig {
+        timestamp_tolerance_us: i64::from(tolerance_secs) * 1_000_000,
+    };
+    let report = validator::run_with_config(Path::new(bundle), &config)?;
     let json =
         serde_json::to_string_pretty(&report).context("failed to serialize validation report")?;
     println!("{json}");
