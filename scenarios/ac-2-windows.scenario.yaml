@@ -1,0 +1,65 @@
+version: "1"
+
+metadata:
+  name: ac-2-windows
+  description: >-
+    Minimal Windows VM scenario. One Linux container (attacker) and
+    one Windows VM (target) on one network segment. Exercises VM
+    provisioning via libvirt, Sysmon telemetry collection, and a
+    simple nmap port scan against Windows services.
+
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+
+duration: 10m
+
+infrastructure:
+  hosts:
+    - name: attacker-001
+      os: linux
+      role: attacker
+      image: alpine:3.19
+    - name: win-target-001
+      os: windows
+      role: target
+      vm:
+        base_image: /var/lib/libvirt/images/windows-server-2022.qcow2
+        memory_mb: 4096
+        vcpus: 2
+        ssh_user: admin
+        ssh_password: changeme
+        sysmon: true
+      setup:
+        - "powershell -Command \"New-NetFirewallRule -DisplayName 'Allow ICMP' -Protocol ICMPv4 -Action Allow\""
+  network:
+    segments:
+      - name: lan
+        subnet: 10.100.0.0/24
+        hosts:
+          - attacker-001
+          - win-target-001
+
+activities:
+  normal:
+    - name: smb-probe
+      source: attacker-001
+      target: win-target-001
+      command: "curl -s --connect-timeout 5 http://${target_ip}:445/ || true"
+      protocol: tcp
+      dst_port: 445
+      start_offset: 60s
+  attack:
+    - name: nmap-windows-scan
+      source: attacker-001
+      target: win-target-001
+      command: "nmap -sS -p 135,139,445,3389 ${target_ip}"
+      protocol: tcp
+      dst_port: 445
+      technique: T1046
+      phase: reconnaissance
+      tool: nmap
+      start_offset: 300s

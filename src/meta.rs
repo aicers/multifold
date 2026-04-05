@@ -17,8 +17,9 @@ pub(crate) fn write(
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
     start: DateTime<Utc>,
+    telemetry: &[(String, String)],
 ) -> Result<()> {
-    let meta = build(scenario_filename, scenario, host_ips, start)?;
+    let meta = build(scenario_filename, scenario, host_ips, start, telemetry)?;
     let json = serde_json::to_string_pretty(&meta).context("failed to serialise meta.json")?;
     let path = output_dir.join("meta.json");
     fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
@@ -30,6 +31,7 @@ fn build(
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
     start: DateTime<Utc>,
+    telemetry: &[(String, String)],
 ) -> Result<BundleMeta> {
     let total_duration = scenario::parse_duration(&scenario.duration)?;
     let end = start + total_duration;
@@ -65,6 +67,15 @@ fn build(
         })
         .collect();
 
+    let host_telemetry: Vec<MetaTelemetryEntry> = telemetry
+        .iter()
+        .map(|(host, path)| MetaTelemetryEntry {
+            host: host.clone(),
+            kind: "sysmon".to_owned(),
+            path: path.clone(),
+        })
+        .collect();
+
     Ok(BundleMeta {
         schema_version: SCHEMA_VERSION.to_owned(),
         scenario: scenario_filename.to_owned(),
@@ -96,6 +107,7 @@ fn build(
                 })
                 .collect(),
         },
+        host_telemetry,
     })
 }
 
@@ -114,6 +126,8 @@ struct BundleMeta {
     hosts: Vec<MetaHost>,
     network: MetaNetwork,
     capture: MetaCapture,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    host_telemetry: Vec<MetaTelemetryEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +176,13 @@ struct MetaPcapEntry {
     path: String,
 }
 
+#[derive(Debug, Serialize)]
+struct MetaTelemetryEntry {
+    host: String,
+    kind: String,
+    path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,7 +208,7 @@ mod tests {
     #[test]
     fn build_meta_matches_expected_structure() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start).unwrap();
+        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
 
         assert_eq!(meta.schema_version, "1");
         assert_eq!(meta.scenario, "ac-0.scenario.yaml");
@@ -211,7 +232,7 @@ mod tests {
     #[test]
     fn build_meta_json_roundtrip() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start).unwrap();
+        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -225,7 +246,7 @@ mod tests {
     #[test]
     fn build_meta_matches_ac0_reference() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start).unwrap();
+        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
         let actual: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
@@ -245,6 +266,7 @@ mod tests {
             &scenario,
             &host_ips,
             start,
+            &[],
         )
         .unwrap();
 
@@ -262,7 +284,7 @@ mod tests {
         let (scenario, _, start) = ac0_test_inputs();
         let host_ips = vec![("ghost-host".to_owned(), vec![Ipv4Addr::new(10, 100, 0, 99)])];
 
-        let err = build("ac-0.scenario.yaml", &scenario, &host_ips, start).unwrap_err();
+        let err = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap_err();
         assert!(
             err.to_string().contains("not found in scenario"),
             "unexpected error: {err}",

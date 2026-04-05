@@ -74,9 +74,53 @@ pub(crate) struct Host {
     pub(crate) name: String,
     pub(crate) os: Os,
     pub(crate) role: Role,
+    #[serde(default)]
     pub(crate) image: String,
     #[serde(default)]
+    pub(crate) vm: Option<VmConfig>,
+    #[serde(default)]
     pub(crate) setup: Vec<String>,
+}
+
+impl Host {
+    /// Returns `true` if this host is provisioned as a libvirt VM.
+    pub(crate) fn is_vm(&self) -> bool {
+        self.vm.is_some()
+    }
+}
+
+/// Configuration for a libvirt-managed virtual machine.
+#[derive(Debug, Deserialize)]
+pub(crate) struct VmConfig {
+    /// Path to the qcow2 base image on the host.
+    pub(crate) base_image: String,
+    /// RAM in megabytes (default: 4096).
+    #[serde(default = "VmConfig::default_memory_mb")]
+    pub(crate) memory_mb: u32,
+    /// Number of virtual CPUs (default: 2).
+    #[serde(default = "VmConfig::default_vcpus")]
+    pub(crate) vcpus: u8,
+    /// SSH user for remote command execution.
+    pub(crate) ssh_user: String,
+    /// SSH password (used with sshpass).
+    pub(crate) ssh_password: String,
+    /// Whether to install and collect Sysmon telemetry (default: true).
+    #[serde(default = "VmConfig::default_sysmon")]
+    pub(crate) sysmon: bool,
+}
+
+impl VmConfig {
+    fn default_memory_mb() -> u32 {
+        4096
+    }
+
+    fn default_vcpus() -> u8 {
+        2
+    }
+
+    fn default_sysmon() -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +302,30 @@ impl Scenario {
                 "duplicate host name '{}'",
                 host.name,
             );
+
+            if let Some(vm) = &host.vm {
+                ensure!(
+                    !vm.base_image.is_empty(),
+                    "VM host '{}' requires a non-empty base_image",
+                    host.name,
+                );
+                ensure!(
+                    vm.memory_mb >= 512,
+                    "VM host '{}' requires at least 512 MB of memory",
+                    host.name,
+                );
+                ensure!(
+                    vm.vcpus >= 1,
+                    "VM host '{}' requires at least 1 vCPU",
+                    host.name,
+                );
+            } else {
+                ensure!(
+                    !host.image.is_empty(),
+                    "host '{}' requires a Docker image (or a 'vm' config for VMs)",
+                    host.name,
+                );
+            }
         }
 
         let mut segment_names = HashSet::new();
@@ -280,6 +348,30 @@ impl Scenario {
                     segment.name,
                 );
             }
+        }
+
+        // VM hosts must appear in exactly one segment (multi-NIC VM
+        // provisioning is not yet supported).
+        let vm_hosts: HashSet<&str> = self
+            .infrastructure
+            .hosts
+            .iter()
+            .filter(|h| h.is_vm())
+            .map(|h| h.name.as_str())
+            .collect();
+        for vm_name in &vm_hosts {
+            let count = self
+                .infrastructure
+                .network
+                .segments
+                .iter()
+                .filter(|seg| seg.hosts.iter().any(|h| h == vm_name))
+                .count();
+            ensure!(
+                count <= 1,
+                "VM host '{vm_name}' appears in {count} segments, \
+                 but multi-segment VM provisioning is not yet supported",
+            );
         }
 
         for a in &self.activities.normal {
@@ -1217,5 +1309,174 @@ activities:
             err.to_string().contains("unsupported scenario version"),
             "unexpected error: {err}",
         );
+    }
+
+    // ── VM / Windows host tests ───────────────────────────────────
+
+    const AC2_YAML: &str = include_str!("../scenarios/ac-2-windows.scenario.yaml");
+
+    #[test]
+    fn ac2_windows_parses_and_validates() {
+        let s: Scenario = serde_yaml::from_str(AC2_YAML).unwrap();
+        s.validate().unwrap();
+        assert_eq!(s.metadata.name, "ac-2-windows");
+        assert_eq!(s.infrastructure.hosts.len(), 2);
+    }
+
+    #[test]
+    fn ac2_windows_host_has_vm_config() {
+        let s: Scenario = serde_yaml::from_str(AC2_YAML).unwrap();
+        let win = &s.infrastructure.hosts[1];
+        assert_eq!(win.name, "win-target-001");
+        assert_eq!(win.os, Os::Windows);
+        assert!(win.is_vm(), "Windows host must have VM config");
+        let vm = win.vm.as_ref().unwrap();
+        assert_eq!(vm.memory_mb, 4096);
+        assert_eq!(vm.vcpus, 2);
+        assert_eq!(vm.ssh_user, "admin");
+        assert!(vm.sysmon);
+    }
+
+    #[test]
+    fn ac2_linux_host_is_not_vm() {
+        let s: Scenario = serde_yaml::from_str(AC2_YAML).unwrap();
+        let linux = &s.infrastructure.hosts[0];
+        assert_eq!(linux.name, "attacker-001");
+        assert!(!linux.is_vm());
+    }
+
+    #[test]
+    fn reject_vm_host_without_base_image() {
+        let yaml = "\
+version: '1'
+metadata:
+  name: test
+  description: test
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+duration: 1m
+infrastructure:
+  hosts:
+    - name: h1
+      os: windows
+      role: target
+      vm:
+        base_image: ''
+        ssh_user: admin
+        ssh_password: pw
+  network:
+    segments:
+      - name: net
+        subnet: 10.0.0.0/24
+        hosts:
+          - h1
+activities:
+  normal: []
+  attack: []
+";
+        let s: Scenario = serde_yaml::from_str(yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("non-empty base_image"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_non_vm_host_without_image() {
+        let yaml = "\
+version: '1'
+metadata:
+  name: test
+  description: test
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+duration: 1m
+infrastructure:
+  hosts:
+    - name: h1
+      os: linux
+      role: target
+  network:
+    segments:
+      - name: net
+        subnet: 10.0.0.0/24
+        hosts:
+          - h1
+activities:
+  normal: []
+  attack: []
+";
+        let s: Scenario = serde_yaml::from_str(yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("requires a Docker image"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_vm_host_in_multiple_segments() {
+        let yaml = "\
+version: '1'
+metadata:
+  name: test
+  description: test
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+duration: 1m
+infrastructure:
+  hosts:
+    - name: win
+      os: windows
+      role: target
+      vm:
+        base_image: /images/win.qcow2
+        ssh_user: admin
+        ssh_password: pw
+    - name: linux
+      os: linux
+      role: attacker
+      image: alpine:3.19
+  network:
+    segments:
+      - name: dmz
+        subnet: 10.0.0.0/24
+        hosts:
+          - win
+          - linux
+      - name: internal
+        subnet: 10.1.0.0/24
+        hosts:
+          - win
+activities:
+  normal: []
+  attack: []
+";
+        let s: Scenario = serde_yaml::from_str(yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("multi-segment VM provisioning is not yet supported"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn accept_vm_host_in_single_segment() {
+        let s: Scenario = serde_yaml::from_str(AC2_YAML).unwrap();
+        s.validate().unwrap();
     }
 }

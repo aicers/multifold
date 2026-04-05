@@ -166,6 +166,11 @@ pub(crate) fn run(bundle: &Path) -> Result<Report> {
         validate_l4_lite(bundle, &gt_records, &mut checks);
     }
 
+    // L1-005 + L2-006: host telemetry files
+    if let Some(m) = &meta {
+        validate_host_telemetry(bundle, m, &mut checks);
+    }
+
     checks.sort_by_key(|c| c.id);
     Ok(Report::new(checks))
 }
@@ -575,6 +580,76 @@ fn check_l3_hosts(meta: &Value, records: &[Value], checks: &mut Vec<Check>) {
         checks.push(fail(
             "L3-008",
             format!("unknown hosts: {}", unknown.join("; ")),
+        ));
+    }
+}
+
+// ── L1-005 + L2-006: host telemetry ─────────────────────────
+
+/// Validates host telemetry files referenced in meta.json.
+///
+/// Checks are skipped silently when no `host_telemetry` array is
+/// present, so Docker-only bundles remain valid without warnings.
+fn validate_host_telemetry(bundle: &Path, meta: &Value, checks: &mut Vec<Check>) {
+    let Some(entries) = meta.get("host_telemetry").and_then(Value::as_array) else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    // L1-005: all referenced telemetry files exist.
+    let mut missing = Vec::new();
+    let mut existing_paths = Vec::new();
+    for entry in entries {
+        let Some(path_str) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if bundle.join(path_str).exists() {
+            existing_paths.push(path_str);
+        } else {
+            missing.push(path_str);
+        }
+    }
+
+    if missing.is_empty() && !existing_paths.is_empty() {
+        checks.push(pass(
+            "L1-005",
+            format!("all {} telemetry file(s) exist", existing_paths.len()),
+        ));
+    } else if !missing.is_empty() {
+        checks.push(fail(
+            "L1-005",
+            format!("telemetry files not found: {}", missing.join(", ")),
+        ));
+    }
+
+    // L2-006: each telemetry JSONL file contains valid JSON lines.
+    let mut bad_files = Vec::new();
+    for path_str in &existing_paths {
+        let full_path = bundle.join(path_str);
+        if let Ok(content) = fs::read_to_string(&full_path) {
+            let has_bad_line = content
+                .lines()
+                .filter(|l| !l.is_empty())
+                .any(|l| serde_json::from_str::<Value>(l).is_err());
+            if has_bad_line {
+                bad_files.push(*path_str);
+            }
+        } else {
+            bad_files.push(*path_str);
+        }
+    }
+
+    if bad_files.is_empty() && !existing_paths.is_empty() {
+        checks.push(pass(
+            "L2-006",
+            "all telemetry JSONL files contain valid JSON",
+        ));
+    } else if !bad_files.is_empty() {
+        checks.push(fail(
+            "L2-006",
+            format!("invalid JSON in telemetry files: {}", bad_files.join(", ")),
         ));
     }
 }
@@ -1435,5 +1510,86 @@ mod tests {
         ] {
             assert_pass(&report, id);
         }
+    }
+
+    // ── L1-005 + L2-006: host telemetry ──────────────────────────
+
+    #[test]
+    fn telemetry_checks_skipped_when_no_host_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        // No L1-005 or L2-006 checks should appear at all.
+        assert!(
+            find_check(&report, "L1-005").is_none(),
+            "L1-005 should be absent when no host_telemetry",
+        );
+        assert!(
+            find_check(&report, "L2-006").is_none(),
+            "L2-006 should be absent when no host_telemetry",
+        );
+    }
+
+    #[test]
+    fn telemetry_files_pass_when_present_and_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+
+        // Add host_telemetry to meta.json.
+        let meta_path = dir.path().join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["host_telemetry"] = serde_json::json!([
+            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+        ]);
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+        // Create the sysmon.jsonl file with valid JSON.
+        let sysmon_path = dir.path().join("host/target-001/sysmon.jsonl");
+        fs::write(&sysmon_path, "{\"EventID\":1}\n{\"EventID\":3}\n").unwrap();
+
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-005");
+        assert_pass(&report, "L2-006");
+    }
+
+    #[test]
+    fn missing_telemetry_file_fails_l1_005() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+
+        let meta_path = dir.path().join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["host_telemetry"] = serde_json::json!([
+            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+        ]);
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+        // Do NOT create the file.
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L1-005");
+    }
+
+    #[test]
+    fn invalid_telemetry_json_fails_l2_006() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+
+        let meta_path = dir.path().join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["host_telemetry"] = serde_json::json!([
+            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+        ]);
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+        // Write invalid JSON.
+        let sysmon_path = dir.path().join("host/target-001/sysmon.jsonl");
+        fs::write(&sysmon_path, "not valid json\n").unwrap();
+
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-005");
+        assert_fail(&report, "L2-006");
     }
 }

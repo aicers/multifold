@@ -12,9 +12,11 @@ mod infra;
 mod meta;
 mod pcap;
 mod scenario;
+mod sysmon;
 #[cfg(test)]
 mod test_util;
 mod validator;
+mod vm;
 
 #[derive(Parser)]
 #[command(
@@ -112,10 +114,18 @@ async fn setup_run_and_assemble(
     output_dir: &Path,
     start: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    // Install Sysmon on VMs that have it enabled.
+    for vm_host in &env.vms {
+        if vm_host.sysmon {
+            sysmon::install_and_configure(vm_host).await?;
+        }
+    }
+
     activity::run_setup(
         &env.docker,
         &scenario.infrastructure.hosts,
         &env.host_containers,
+        &env.vms,
     )
     .await?;
 
@@ -126,6 +136,7 @@ async fn setup_run_and_assemble(
         &env.host_ips,
         &scenario.activities,
         start,
+        &env.vms,
     )
     .await?;
     println!("Executed {} activity(ies)", executions.len());
@@ -143,6 +154,18 @@ async fn setup_run_and_assemble(
         failures.join("\n  "),
     );
 
+    // Collect Sysmon logs from VMs before stopping collectors.
+    let mut telemetry: Vec<(String, String)> = Vec::new();
+    for vm_host in &env.vms {
+        if vm_host.sysmon {
+            let rel_path = sysmon::collect_logs(vm_host, output_dir).await?;
+            telemetry.push((
+                vm_host.host_name.clone(),
+                rel_path.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+
     // Stop capture containers so pcap files are flushed and complete.
     env.stop_collectors().await?;
     println!("Stopped collectors");
@@ -156,6 +179,7 @@ async fn setup_run_and_assemble(
         &env.host_ips,
         start,
         &mut executions,
+        &telemetry,
     )
 }
 
@@ -171,6 +195,7 @@ fn assemble_bundle(
     host_ips: &[(String, Vec<std::net::Ipv4Addr>)],
     start: chrono::DateTime<chrono::Utc>,
     executions: &mut [activity::Execution],
+    telemetry: &[(String, String)],
 ) -> Result<()> {
     let net_dir = output_dir.join("net");
     pcap::enrich_src_ports(&net_dir, executions)?;
@@ -183,7 +208,14 @@ fn assemble_bundle(
         || scenario_path.to_owned(),
         |n| n.to_string_lossy().into_owned(),
     );
-    meta::write(output_dir, &scenario_filename, scenario, host_ips, start)?;
+    meta::write(
+        output_dir,
+        &scenario_filename,
+        scenario,
+        host_ips,
+        start,
+        telemetry,
+    )?;
     println!("Wrote meta.json");
 
     Ok(())
@@ -310,6 +342,7 @@ mod tests {
             &host_ips,
             start,
             &mut executions,
+            &[],
         )
         .unwrap();
 
@@ -361,6 +394,7 @@ mod tests {
             &host_ips,
             start,
             &mut executions,
+            &[],
         )
         .unwrap();
 
@@ -412,6 +446,7 @@ mod tests {
             &host_ips,
             start,
             &mut executions,
+            &[],
         )
         .unwrap();
 
