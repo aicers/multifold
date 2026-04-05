@@ -74,7 +74,7 @@ pub(crate) fn read_all_packets(net_dir: &Path) -> Result<Vec<Packet>> {
 }
 
 #[allow(clippy::similar_names)] // ts_sec / ts_usec are pcap spec field names
-fn parse_pcap(path: &Path) -> Result<Vec<Packet>> {
+pub(crate) fn parse_pcap(path: &Path) -> Result<Vec<Packet>> {
     let data =
         std::fs::read(path).with_context(|| format!("failed to read pcap: {}", path.display()))?;
     ensure!(

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Result, ensure};
+use ipnet::Ipv4Net;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -49,6 +50,35 @@ const VALID_PHASES: &[&str] = &[
 const PCAP_MAGIC_LE: [u8; 4] = [0xd4, 0xc3, 0xb2, 0xa1];
 const PCAP_MAGIC_BE: [u8; 4] = [0xa1, 0xb2, 0xc3, 0xd4];
 const PCAPNG_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
+
+/// Default timestamp tolerance: 1 second (1,000,000 microseconds).
+///
+/// Ground-truth timestamps are recorded at second precision while PCAP
+/// packet timestamps use microsecond precision.  The tolerance extends
+/// the end of the GT matching window so that trailing packets within
+/// the same wall-clock second are not missed.
+const DEFAULT_TIMESTAMP_TOLERANCE_US: i64 = 1_000_000;
+
+/// Configuration knobs for the validator.
+pub(crate) struct ValidatorConfig {
+    /// Timestamp tolerance in microseconds added to GT record end
+    /// times when matching against PCAP flows and Sysmon events.
+    pub(crate) timestamp_tolerance_us: i64,
+}
+
+impl Default for ValidatorConfig {
+    fn default() -> Self {
+        Self {
+            timestamp_tolerance_us: DEFAULT_TIMESTAMP_TOLERANCE_US,
+        }
+    }
+}
+
+/// Packets from a single PCAP file keyed to a network segment.
+struct SegmentCapture {
+    subnet: Ipv4Net,
+    packets: Vec<pcap::Packet>,
+}
 
 // ── Report types ────────────────────────────────────────────
 
@@ -140,8 +170,14 @@ fn warn(id: &'static str, message: impl Into<String>) -> Check {
 
 // ── Main entry point ────────────────────────────────────────
 
-/// Validates a dataset bundle and returns a structured report.
+/// Validates a dataset bundle with default configuration.
+#[cfg(test)]
 pub(crate) fn run(bundle: &Path) -> Result<Report> {
+    run_with_config(bundle, &ValidatorConfig::default())
+}
+
+/// Validates a dataset bundle using the supplied configuration.
+pub(crate) fn run_with_config(bundle: &Path, config: &ValidatorConfig) -> Result<Report> {
     ensure!(
         bundle.is_dir(),
         "bundle path is not a directory: {}",
@@ -171,9 +207,23 @@ pub(crate) fn run(bundle: &Path) -> Result<Report> {
         validate_gt_integrity(meta.as_ref(), &gt_records, &mut checks);
     }
 
-    // L4-001: cross-artifact matching
+    // L4-001 + L4-003: PCAP flow matching (shared segment captures)
     if !gt_records.is_empty() {
-        validate_l4_lite(bundle, &gt_records, &mut checks);
+        let segment_captures = load_segment_captures(bundle, meta.as_ref());
+        validate_l4_lite(
+            bundle,
+            &segment_captures,
+            &gt_records,
+            config.timestamp_tolerance_us,
+            &mut checks,
+        );
+        validate_l4_campaign(
+            bundle,
+            &segment_captures,
+            &gt_records,
+            config.timestamp_tolerance_us,
+            &mut checks,
+        );
     }
 
     // L1-005 + L2-006: host telemetry files
@@ -190,7 +240,12 @@ pub(crate) fn run(bundle: &Path) -> Result<Report> {
 
     // L4-002: GT process records ↔ Sysmon temporal overlap
     if !gt_records.is_empty() {
-        validate_l4_sysmon(&gt_records, &sysmon_data, &mut checks);
+        validate_l4_sysmon(
+            &gt_records,
+            &sysmon_data,
+            config.timestamp_tolerance_us,
+            &mut checks,
+        );
     }
 
     checks.sort_by_key(|c| c.id);
@@ -890,23 +945,16 @@ fn validate_sysmon(
 
 // ── L4-001 ──────────────────────────────────────────────────
 
-fn validate_l4_lite(bundle: &Path, records: &[Value], checks: &mut Vec<Check>) {
+fn validate_l4_lite(
+    bundle: &Path,
+    segment_captures: &[SegmentCapture],
+    records: &[Value],
+    tolerance_us: i64,
+    checks: &mut Vec<Check>,
+) {
     let net_dir = bundle.join("net");
     if !net_dir.is_dir() {
         checks.push(fail("L4-001", "net/ directory not found"));
-        return;
-    }
-
-    let packets = match pcap::read_all_packets(&net_dir) {
-        Ok(p) => p,
-        Err(e) => {
-            checks.push(fail("L4-001", format!("failed to read PCAP files: {e}")));
-            return;
-        }
-    };
-
-    if packets.is_empty() {
-        checks.push(fail("L4-001", "no packets found in PCAP files"));
         return;
     }
 
@@ -920,9 +968,37 @@ fn validate_l4_lite(bundle: &Path, records: &[Value], checks: &mut Vec<Check>) {
         return;
     }
 
+    // Fall back to flat packet list when segment info is unavailable.
+    let all_packets = if segment_captures.is_empty() {
+        match pcap::read_all_packets(&net_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                checks.push(fail("L4-001", format!("failed to read PCAP files: {e}")));
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let total_packets: usize = if segment_captures.is_empty() {
+        all_packets.len()
+    } else {
+        segment_captures.iter().map(|c| c.packets.len()).sum()
+    };
+    if total_packets == 0 {
+        checks.push(fail("L4-001", "no packets found in PCAP files"));
+        return;
+    }
+
     let mut unmatched = Vec::new();
     for (i, record) in network_records.iter().enumerate() {
-        if !matches_any_packet(record, &packets) {
+        let matched = if segment_captures.is_empty() {
+            matches_any_packet(record, &all_packets, tolerance_us)
+        } else {
+            matches_segment_packet(record, segment_captures, tolerance_us)
+        };
+        if !matched {
             unmatched.push(i + 1);
         }
     }
@@ -947,7 +1023,8 @@ fn validate_l4_lite(bundle: &Path, records: &[Value], checks: &mut Vec<Check>) {
     }
 }
 
-fn matches_any_packet(record: &Value, packets: &[pcap::Packet]) -> bool {
+/// Checks whether `record` matches any packet in the flat list.
+fn matches_any_packet(record: &Value, packets: &[pcap::Packet], tolerance_us: i64) -> bool {
     let start_us = record
         .get("start")
         .and_then(Value::as_str)
@@ -960,7 +1037,159 @@ fn matches_any_packet(record: &Value, packets: &[pcap::Packet]) -> bool {
     let (Some(start_us), Some(end_us)) = (start_us, end_us) else {
         return false;
     };
-    let end_us = end_us + 1_000_000;
+    let end_us = end_us + tolerance_us;
+
+    let src_ip = record
+        .get("src_ip")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    let dst_ip = record
+        .get("dst_ip")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    let src_port = record
+        .get("src_port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok());
+    let dst_port = record
+        .get("dst_port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok());
+    let protocol = record
+        .get("protocol")
+        .and_then(Value::as_str)
+        .and_then(parse_protocol);
+
+    let (Some(src_ip), Some(dst_ip), Some(src_port), Some(dst_port), Some(protocol)) =
+        (src_ip, dst_ip, src_port, dst_port, protocol)
+    else {
+        return false;
+    };
+
+    packets.iter().any(|p| {
+        p.ts_us >= start_us
+            && p.ts_us <= end_us
+            && p.src_ip == src_ip
+            && p.dst_ip == dst_ip
+            && p.src_port == src_port
+            && p.dst_port == dst_port
+            && p.protocol == protocol
+    })
+}
+
+/// Loads packets grouped by network segment using meta.json.
+///
+/// Joins `capture.pcaps` entries with `network.segments` by segment
+/// name, parsing each PCAP independently.  Returns an empty vec when
+/// meta data is missing or no entry carries a `vantage_point`, so the
+/// caller falls back to flat matching (backward compatible).
+fn load_segment_captures(bundle: &Path, meta: Option<&Value>) -> Vec<SegmentCapture> {
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+
+    let pcap_entries = meta
+        .get("capture")
+        .and_then(|c| c.get("pcaps"))
+        .and_then(Value::as_array);
+
+    let Some(entries) = pcap_entries else {
+        return Vec::new();
+    };
+
+    // Only activate segment-aware matching when at least one PCAP
+    // carries a vantage_point (i.e. dual-capture topology).
+    let has_vantage_points = entries
+        .iter()
+        .any(|e| e.get("vantage_point").and_then(Value::as_str).is_some());
+    if !has_vantage_points {
+        return Vec::new();
+    }
+
+    // Build a segment-name → subnet lookup from network.segments.
+    let subnets: HashMap<&str, &str> = meta
+        .get("network")
+        .and_then(|n| n.get("segments"))
+        .and_then(Value::as_array)
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|s| {
+                    let name = s.get("name").and_then(Value::as_str)?;
+                    let subnet = s.get("subnet").and_then(Value::as_str)?;
+                    Some((name, subnet))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut result = Vec::new();
+    for entry in entries {
+        let Some(seg_name) = entry.get("segment").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path_str) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(subnet_str) = subnets.get(seg_name) else {
+            continue;
+        };
+        let Ok(subnet) = subnet_str.parse::<Ipv4Net>() else {
+            continue;
+        };
+
+        let pcap_path = bundle.join(path_str);
+        let packets = pcap::parse_pcap(&pcap_path).unwrap_or_default();
+
+        result.push(SegmentCapture { subnet, packets });
+    }
+
+    result
+}
+
+/// Matches a GT record against per-segment PCAP packets.
+///
+/// Finds the segment whose subnet contains both `src_ip` and `dst_ip`
+/// of the record, then searches only that segment's packets.  If no
+/// segment covers both endpoints, all segments are searched as a
+/// fallback.
+fn matches_segment_packet(record: &Value, captures: &[SegmentCapture], tolerance_us: i64) -> bool {
+    let src_ip = record
+        .get("src_ip")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    let dst_ip = record
+        .get("dst_ip")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+
+    if let (Some(src_ip), Some(dst_ip)) = (src_ip, dst_ip) {
+        for cap in captures {
+            if cap.subnet.contains(&src_ip) && cap.subnet.contains(&dst_ip) {
+                return matches_any_packet(record, &cap.packets, tolerance_us);
+            }
+        }
+    }
+
+    // Fallback: no matching segment — search all segments.
+    let all: Vec<&pcap::Packet> = captures.iter().flat_map(|c| &c.packets).collect();
+    matches_any_packet_refs(record, &all, tolerance_us)
+}
+
+/// Same as [`matches_any_packet`] but accepts a slice of references.
+fn matches_any_packet_refs(record: &Value, packets: &[&pcap::Packet], tolerance_us: i64) -> bool {
+    let start_us = record
+        .get("start")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp_us);
+    let end_us = record
+        .get("end")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp_us);
+
+    let (Some(start_us), Some(end_us)) = (start_us, end_us) else {
+        return false;
+    };
+    let end_us = end_us + tolerance_us;
 
     let src_ip = record
         .get("src_ip")
@@ -1006,6 +1235,77 @@ fn parse_timestamp_us(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_micros())
 }
 
+// ── L4-003 ──────────────────────────────────────────────────
+
+/// Verifies that every step of every campaign has a matching PCAP flow.
+///
+/// Only network-session campaign steps are checked.  If no campaigns
+/// exist the check passes vacuously.
+fn validate_l4_campaign(
+    bundle: &Path,
+    segment_captures: &[SegmentCapture],
+    records: &[Value],
+    tolerance_us: i64,
+    checks: &mut Vec<Check>,
+) {
+    let mut campaigns: HashMap<&str, Vec<(u64, &Value)>> = HashMap::new();
+    for r in records {
+        if r.get("session_type").and_then(Value::as_str) != Some("network") {
+            continue;
+        }
+        if let Some(cid) = r.get("campaign_id").and_then(Value::as_str) {
+            let step = r.get("step").and_then(Value::as_u64).unwrap_or(0);
+            campaigns.entry(cid).or_default().push((step, r));
+        }
+    }
+
+    if campaigns.is_empty() {
+        checks.push(pass("L4-003", "no campaign records to check"));
+        return;
+    }
+
+    let net_dir = bundle.join("net");
+    let all_packets = if segment_captures.is_empty() {
+        pcap::read_all_packets(&net_dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let campaign_count = campaigns.len();
+    let mut incomplete = Vec::new();
+    for (cid, mut steps) in campaigns {
+        steps.sort_unstable_by_key(|(s, _)| *s);
+        let mut missing_steps = Vec::new();
+        for &(step, record) in &steps {
+            let matched = if segment_captures.is_empty() {
+                matches_any_packet(record, &all_packets, tolerance_us)
+            } else {
+                matches_segment_packet(record, segment_captures, tolerance_us)
+            };
+            if !matched {
+                missing_steps.push(step);
+            }
+        }
+        if !missing_steps.is_empty() {
+            incomplete.push(format!(
+                "campaign '{cid}': missing artifact for step(s) {missing_steps:?}",
+            ));
+        }
+    }
+
+    if incomplete.is_empty() {
+        checks.push(pass(
+            "L4-003",
+            format!("all {campaign_count} campaign(s) have complete PCAP coverage"),
+        ));
+    } else {
+        checks.push(fail(
+            "L4-003",
+            format!("incomplete campaign coverage: {}", incomplete.join("; ")),
+        ));
+    }
+}
+
 // ── L4-002 ──────────────────────────────────────────────────
 
 /// Verifies that each GT process record has temporal overlap with at
@@ -1013,6 +1313,7 @@ fn parse_timestamp_us(s: &str) -> Option<i64> {
 fn validate_l4_sysmon(
     records: &[Value],
     host_events: &[(String, Vec<Value>)],
+    tolerance_us: i64,
     checks: &mut Vec<Check>,
 ) {
     let process_records: Vec<(usize, &Value)> = records
@@ -1047,7 +1348,7 @@ fn validate_l4_sysmon(
 
         let has_overlap = match (host, start_us, end_us) {
             (Some(host), Some(start_us), Some(end_us)) => {
-                let end_us = end_us + 1_000_000;
+                let end_us = end_us + tolerance_us;
                 host_events
                     .iter()
                     .filter(|(h, _)| h == host)
@@ -1279,7 +1580,7 @@ mod tests {
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
             "L2-005", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005", "L3-006", "L3-007",
-            "L3-008", "L3-009", "L3-010", "L4-001",
+            "L3-008", "L3-009", "L3-010", "L4-001", "L4-003",
         ] {
             assert_pass(&report, id);
         }
@@ -1841,7 +2142,7 @@ mod tests {
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
             "L2-005", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005", "L3-006", "L3-007",
-            "L3-008", "L3-009", "L3-010", "L4-001",
+            "L3-008", "L3-009", "L3-010", "L4-001", "L4-003",
         ] {
             assert_pass(&report, id);
         }
@@ -2352,9 +2653,267 @@ mod tests {
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L1-006", "L2-001", "L2-002", "L2-003",
             "L2-004", "L2-005", "L2-008", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005",
-            "L3-006", "L3-007", "L3-008", "L3-009", "L3-010", "L4-001", "L4-002",
+            "L3-006", "L3-007", "L3-008", "L3-009", "L3-010", "L4-001", "L4-002", "L4-003",
         ] {
             assert_pass(&report, id);
         }
+    }
+
+    // ── Dual-PCAP vantage point matching ─────────────────────
+
+    const TLS_NORMAL_EDGE: &str = concat!(
+        r#"{"scope":"session","label":"normal","#,
+        r#""start":"2026-01-15T09:00:30Z","end":"2026-01-15T09:00:31Z","#,
+        r#""source":"attacker-001","target":"proxy-001","#,
+        r#""session_type":"network","protocol":"tcp","#,
+        r#""src_ip":"10.200.0.2","src_port":49152,"#,
+        r#""dst_ip":"10.200.0.3","dst_port":443}"#,
+    );
+
+    const TLS_ATTACK_EDGE: &str = concat!(
+        r#"{"scope":"session","label":"anomaly","#,
+        r#""start":"2026-01-15T09:02:00Z","end":"2026-01-15T09:02:01Z","#,
+        r#""source":"attacker-001","target":"proxy-001","#,
+        r#""session_type":"network","protocol":"tcp","#,
+        r#""src_ip":"10.200.0.2","src_port":50000,"#,
+        r#""dst_ip":"10.200.0.3","dst_port":443,"#,
+        r#""category":"attack","technique":"T1046","#,
+        r#""phase":"reconnaissance","tool":"nmap"}"#,
+    );
+
+    fn meta_json_tls() -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "1",
+            "scenario": "ac-2-tls.scenario.yaml",
+            "scenario_version": "1",
+            "generated_at": "2026-01-15T09:00:00Z",
+            "duration": {
+                "total": "5m",
+                "actual_start": "2026-01-15T09:00:00Z",
+                "actual_end": "2026-01-15T09:05:00Z"
+            },
+            "environment": {
+                "scale": "minimal",
+                "encryption": "tls",
+                "workload": "light",
+                "threat": "single",
+                "attacker": "scripted"
+            },
+            "hosts": [
+                {"name": "attacker-001", "os": "linux", "role": "attacker",
+                 "ips": ["10.200.0.2"]},
+                {"name": "proxy-001", "os": "linux", "role": "observer",
+                 "ips": ["10.200.0.3", "10.200.1.2"]},
+                {"name": "backend-001", "os": "linux", "role": "target",
+                 "ips": ["10.200.1.3"]}
+            ],
+            "network": {
+                "segments": [
+                    {"name": "edge", "subnet": "10.200.0.0/24"},
+                    {"name": "inner", "subnet": "10.200.1.0/24"}
+                ]
+            },
+            "capture": {
+                "pcaps": [
+                    {"segment": "edge", "path": "net/edge.pcap",
+                     "vantage_point": "pre_tls_termination"},
+                    {"segment": "inner", "path": "net/inner.pcap",
+                     "vantage_point": "post_tls_termination"}
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn create_tls_bundle(dir: &Path) {
+        fs::create_dir_all(dir.join("ground_truth")).unwrap();
+        fs::create_dir_all(dir.join("net")).unwrap();
+        fs::create_dir_all(dir.join("host/attacker-001")).unwrap();
+        fs::create_dir_all(dir.join("host/proxy-001")).unwrap();
+        fs::create_dir_all(dir.join("host/backend-001")).unwrap();
+
+        fs::write(dir.join("meta.json"), meta_json_tls()).unwrap();
+        fs::write(
+            dir.join("ground_truth/manifest.jsonl"),
+            format!("{TLS_NORMAL_EDGE}\n{TLS_ATTACK_EDGE}\n"),
+        )
+        .unwrap();
+
+        let edge_pcap = build_pcap(&[
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:00:30Z"),
+                src_ip: [10, 200, 0, 2],
+                dst_ip: [10, 200, 0, 3],
+                src_port: 49152,
+                dst_port: 443,
+            },
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:02:00Z"),
+                src_ip: [10, 200, 0, 2],
+                dst_ip: [10, 200, 0, 3],
+                src_port: 50000,
+                dst_port: 443,
+            },
+        ]);
+        fs::write(dir.join("net/edge.pcap"), edge_pcap).unwrap();
+
+        // Inner PCAP is empty (no plaintext GT records in this scenario).
+        fs::write(dir.join("net/inner.pcap"), pcap_global_header()).unwrap();
+    }
+
+    #[test]
+    fn tls_bundle_passes_l4_001() {
+        let dir = tempfile::tempdir().unwrap();
+        create_tls_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-001");
+    }
+
+    #[test]
+    fn tls_gt_matched_to_correct_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        create_tls_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_eq!(
+            report.summary.failed, 0,
+            "expected no failures: {:#?}",
+            report.checks,
+        );
+        assert_pass(&report, "L4-001");
+        assert_pass(&report, "L4-003");
+    }
+
+    #[test]
+    fn tls_gt_no_match_in_own_segment_fails_l4_001() {
+        let dir = tempfile::tempdir().unwrap();
+        create_tls_bundle(dir.path());
+
+        // Move edge packets into inner.pcap; leave edge.pcap empty.
+        // The GT record IPs belong to the edge subnet, so the validator
+        // must look in edge.pcap (now empty) and fail.
+        let wrong_pcap = build_pcap(&[PcapFlow {
+            ts: ts_for("2026-01-15T09:00:30Z"),
+            src_ip: [10, 200, 0, 2],
+            dst_ip: [10, 200, 0, 3],
+            src_port: 49152,
+            dst_port: 443,
+        }]);
+        fs::write(dir.path().join("net/edge.pcap"), pcap_global_header()).unwrap();
+        fs::write(dir.path().join("net/inner.pcap"), wrong_pcap).unwrap();
+
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-001");
+    }
+
+    #[test]
+    fn single_segment_without_vantage_point_uses_flat_matching() {
+        // Backward compat: bundles with no vantage_point still work.
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-001");
+    }
+
+    // ── L4-003 campaign alignment ────────────────────────────
+
+    #[test]
+    fn campaign_all_steps_covered_passes_l4_003() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-003");
+    }
+
+    #[test]
+    fn no_campaigns_passes_l4_003() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-003");
+    }
+
+    #[test]
+    fn campaign_missing_step_pcap_fails_l4_003() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        // PCAP matches normal + step 1, but not step 2 (src_port 50001).
+        let data = build_pcap(&[
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:00:30Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 49152,
+                dst_port: 80,
+            },
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:02:00Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 50000,
+                dst_port: 80,
+            },
+        ]);
+        fs::write(dir.path().join("net/lan.pcap"), data).unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-003");
+        assert_fail(&report, "L4-001");
+    }
+
+    // ── Configurable timestamp tolerance ─────────────────────
+
+    #[test]
+    fn custom_tolerance_extends_matching_window() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        // Attack record ends at 09:02:01Z.  Place its matching packet
+        // at 09:02:04Z — 3 s past the end.
+        let data = build_pcap(&[
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:00:30Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 49152,
+                dst_port: 80,
+            },
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:02:04Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 50000,
+                dst_port: 80,
+            },
+        ]);
+        fs::write(dir.path().join("net/lan.pcap"), data).unwrap();
+
+        // Default tolerance (1 s): packet at +3 s is out of range.
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-001");
+
+        // Custom tolerance (5 s): packet at +3 s is within range.
+        let config = ValidatorConfig {
+            timestamp_tolerance_us: 5_000_000,
+        };
+        let report = run_with_config(dir.path(), &config).unwrap();
+        assert_pass(&report, "L4-001");
+    }
+
+    #[test]
+    fn zero_tolerance_requires_exact_window() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+
+        // Default tolerance (1 s) — both records should match.
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-001");
+
+        // Zero tolerance — a packet exactly at end_us still matches
+        // because the condition is p.ts_us <= end_us + 0.
+        let config = ValidatorConfig {
+            timestamp_tolerance_us: 0,
+        };
+        let report = run_with_config(dir.path(), &config).unwrap();
+        // Packets are at exact second boundaries so they land within
+        // [start_us, end_us] even with no tolerance.
+        assert_pass(&report, "L4-001");
     }
 }
