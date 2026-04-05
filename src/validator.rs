@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -409,6 +409,8 @@ fn validate_gt_integrity(meta: Option<&Value>, records: &[Value], checks: &mut V
     if let Some(m) = meta {
         check_l3_hosts(m, records, checks);
     }
+    check_l3_campaign_ordering(records, checks);
+    check_l3_campaign_temporal(records, checks);
 }
 
 /// L3-001: start <= end for all records.
@@ -580,6 +582,93 @@ fn check_l3_hosts(meta: &Value, records: &[Value], checks: &mut Vec<Check>) {
         checks.push(fail(
             "L3-008",
             format!("unknown hosts: {}", unknown.join("; ")),
+        ));
+    }
+}
+
+/// L3-009: campaign steps are sequential (1, 2, 3, …) with no gaps or
+/// duplicates within each `campaign_id`.
+fn check_l3_campaign_ordering(records: &[Value], checks: &mut Vec<Check>) {
+    let mut campaigns: HashMap<&str, Vec<(u64, usize)>> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        if let Some(cid) = r.get("campaign_id").and_then(Value::as_str) {
+            let step = r.get("step").and_then(Value::as_u64).unwrap_or(0);
+            campaigns.entry(cid).or_default().push((step, i + 1));
+        }
+    }
+
+    if campaigns.is_empty() {
+        checks.push(pass("L3-009", "no campaign records to check"));
+        return;
+    }
+
+    let mut errors = Vec::new();
+    for (cid, mut steps) in campaigns {
+        steps.sort_unstable_by_key(|(s, _)| *s);
+        for (i, (step, record_num)) in steps.iter().enumerate() {
+            let expected = (i + 1) as u64;
+            if *step != expected {
+                errors.push(format!(
+                    "campaign '{cid}' record {record_num}: expected step {expected}, got {step}",
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        checks.push(pass("L3-009", "campaign steps are sequential"));
+    } else {
+        checks.push(fail(
+            "L3-009",
+            format!("campaign step ordering errors: {}", errors.join("; ")),
+        ));
+    }
+}
+
+/// L3-010: within each campaign, higher steps have equal or later start
+/// times (temporal consistency).
+fn check_l3_campaign_temporal(records: &[Value], checks: &mut Vec<Check>) {
+    let mut campaigns: HashMap<&str, Vec<(u64, i64, usize)>> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        if let Some(cid) = r.get("campaign_id").and_then(Value::as_str) {
+            let step = r.get("step").and_then(Value::as_u64).unwrap_or(0);
+            let start_us = r
+                .get("start")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp_us)
+                .unwrap_or(0);
+            campaigns
+                .entry(cid)
+                .or_default()
+                .push((step, start_us, i + 1));
+        }
+    }
+
+    if campaigns.is_empty() {
+        checks.push(pass("L3-010", "no campaign records to check"));
+        return;
+    }
+
+    let mut errors = Vec::new();
+    for (cid, mut steps) in campaigns {
+        steps.sort_unstable_by_key(|(s, _, _)| *s);
+        for pair in steps.windows(2) {
+            let (step_a, ts_a, _) = pair[0];
+            let (step_b, ts_b, rec_b) = pair[1];
+            if ts_b < ts_a {
+                errors.push(format!(
+                    "campaign '{cid}': step {step_b} (record {rec_b}) starts before step {step_a}",
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        checks.push(pass("L3-010", "campaign steps are temporally consistent"));
+    } else {
+        checks.push(fail(
+            "L3-010",
+            format!("temporal consistency errors: {}", errors.join("; ")),
         ));
     }
 }
@@ -940,7 +1029,7 @@ mod tests {
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
             "L2-005", "L3-001", "L3-002", "L3-003", "L3-005", "L3-006", "L3-007", "L3-008",
-            "L4-001",
+            "L3-009", "L3-010", "L4-001",
         ] {
             assert_pass(&report, id);
         }
@@ -1506,7 +1595,7 @@ mod tests {
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
             "L2-005", "L3-001", "L3-002", "L3-003", "L3-005", "L3-006", "L3-007", "L3-008",
-            "L4-001",
+            "L3-009", "L3-010", "L4-001",
         ] {
             assert_pass(&report, id);
         }
@@ -1591,5 +1680,139 @@ mod tests {
         let report = run(dir.path()).unwrap();
         assert_pass(&report, "L1-005");
         assert_fail(&report, "L2-006");
+    }
+
+    // ── L3-009 + L3-010: campaign checks ──────────────────────
+
+    const CAMPAIGN_STEP1: &str = r#"{"scope":"session","label":"anomaly","start":"2026-01-15T09:02:00Z","end":"2026-01-15T09:02:01Z","source":"attacker-001","target":"target-001","session_type":"network","protocol":"tcp","src_ip":"10.100.0.2","src_port":50000,"dst_ip":"10.100.0.3","dst_port":80,"category":"attack","technique":"T1046","phase":"reconnaissance","tool":"nmap","campaign_id":"campaign-001","step":1}"#;
+
+    const CAMPAIGN_STEP2: &str = r#"{"scope":"session","label":"anomaly","start":"2026-01-15T09:03:00Z","end":"2026-01-15T09:03:01Z","source":"attacker-001","target":"target-001","session_type":"network","protocol":"tcp","src_ip":"10.100.0.2","src_port":50001,"dst_ip":"10.100.0.3","dst_port":80,"category":"attack","technique":"T1048","phase":"exfiltration","tool":"curl","campaign_id":"campaign-001","step":2}"#;
+
+    fn campaign_gt_content() -> String {
+        format!("{NORMAL_RECORD}\n{CAMPAIGN_STEP1}\n{CAMPAIGN_STEP2}\n")
+    }
+
+    fn campaign_pcap() -> Vec<u8> {
+        build_pcap(&[
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:00:30Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 49152,
+                dst_port: 80,
+            },
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:02:00Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 50000,
+                dst_port: 80,
+            },
+            PcapFlow {
+                ts: ts_for("2026-01-15T09:03:00Z"),
+                src_ip: [10, 100, 0, 2],
+                dst_ip: [10, 100, 0, 3],
+                src_port: 50001,
+                dst_port: 80,
+            },
+        ])
+    }
+
+    fn create_campaign_bundle(dir: &Path) {
+        fs::create_dir_all(dir.join("ground_truth")).unwrap();
+        fs::create_dir_all(dir.join("net")).unwrap();
+        fs::create_dir_all(dir.join("host/attacker-001")).unwrap();
+        fs::create_dir_all(dir.join("host/target-001")).unwrap();
+        fs::write(dir.join("meta.json"), meta_json()).unwrap();
+        fs::write(
+            dir.join("ground_truth/manifest.jsonl"),
+            campaign_gt_content(),
+        )
+        .unwrap();
+        fs::write(dir.join("net/capture-lan.pcap"), campaign_pcap()).unwrap();
+    }
+
+    #[test]
+    fn valid_campaign_passes_l3_009_and_l3_010() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L3-009");
+        assert_pass(&report, "L3-010");
+    }
+
+    #[test]
+    fn no_campaigns_passes_l3_009_and_l3_010() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L3-009");
+        assert_pass(&report, "L3-010");
+    }
+
+    #[test]
+    fn campaign_step_gap_fails_l3_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        // Replace step 2 with step 3 to create a gap.
+        let bad_step = CAMPAIGN_STEP2.replace("\"step\":2", "\"step\":3");
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{CAMPAIGN_STEP1}\n{bad_step}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L3-009");
+    }
+
+    #[test]
+    fn campaign_duplicate_step_fails_l3_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        // Two records with step 1.
+        let dup_step = CAMPAIGN_STEP2.replace("\"step\":2", "\"step\":1");
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{CAMPAIGN_STEP1}\n{dup_step}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L3-009");
+    }
+
+    #[test]
+    fn campaign_step2_before_step1_fails_l3_010() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        // Make step 2 start before step 1.
+        let early_step2 = CAMPAIGN_STEP2.replace(
+            "\"start\":\"2026-01-15T09:03:00Z\"",
+            "\"start\":\"2026-01-15T09:01:00Z\"",
+        );
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{CAMPAIGN_STEP1}\n{early_step2}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L3-010");
+    }
+
+    #[test]
+    fn campaign_equal_start_times_passes_l3_010() {
+        let dir = tempfile::tempdir().unwrap();
+        create_campaign_bundle(dir.path());
+        // Give step 2 the same start as step 1.
+        let same_start = CAMPAIGN_STEP2.replace(
+            "\"start\":\"2026-01-15T09:03:00Z\"",
+            "\"start\":\"2026-01-15T09:02:00Z\"",
+        );
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{CAMPAIGN_STEP1}\n{same_start}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L3-010");
     }
 }

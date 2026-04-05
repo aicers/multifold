@@ -35,6 +35,8 @@ pub(crate) struct AttackDetail {
     pub(crate) technique: String,
     pub(crate) phase: Phase,
     pub(crate) tool: String,
+    pub(crate) campaign_id: Option<String>,
+    pub(crate) step: Option<u32>,
 }
 
 /// A unified activity ready for execution.
@@ -52,6 +54,8 @@ struct AttackRef<'a> {
     technique: &'a str,
     phase: Phase,
     tool: &'a str,
+    campaign_id: Option<&'a str>,
+    step: Option<u32>,
 }
 
 /// Runs per-host setup commands before any activities start.
@@ -173,6 +177,8 @@ pub(crate) async fn run(
             technique: a.technique.to_owned(),
             phase: a.phase,
             tool: a.tool.to_owned(),
+            campaign_id: a.campaign_id.map(str::to_owned),
+            step: a.step,
         });
 
         tasks.spawn(async move {
@@ -282,6 +288,8 @@ fn build_schedule(activities: &Activities) -> Result<Vec<Scheduled<'_>>> {
                 technique: &a.technique,
                 phase: a.phase,
                 tool: &a.tool,
+                campaign_id: a.campaign_id.as_deref(),
+                step: a.step,
             }),
         });
     }
@@ -495,6 +503,8 @@ mod tests {
             phase: Phase::Reconnaissance,
             tool: "nmap".to_owned(),
             start_offset: offset.to_owned(),
+            campaign_id: None,
+            step: None,
         }
     }
 
@@ -600,6 +610,8 @@ mod tests {
                 phase: Phase::Reconnaissance,
                 tool: "nmap".to_owned(),
                 start_offset: "2m".to_owned(),
+                campaign_id: None,
+                step: None,
             }],
         };
         let schedule = build_schedule(&activities).unwrap();
@@ -667,6 +679,8 @@ mod tests {
                 phase: Phase::Reconnaissance,
                 tool: "nmap".to_owned(),
                 start_offset: "20s".to_owned(),
+                campaign_id: None,
+                step: None,
             }],
         };
         let sources = activity_sources(&activities);
