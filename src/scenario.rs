@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -166,6 +166,10 @@ pub(crate) struct AttackActivity {
     pub(crate) phase: Phase,
     pub(crate) tool: String,
     pub(crate) start_offset: String,
+    #[serde(default)]
+    pub(crate) campaign_id: Option<String>,
+    #[serde(default)]
+    pub(crate) step: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -268,8 +272,65 @@ fn validate_host_refs(
     Ok(())
 }
 
+/// Validates that `campaign_id` and `step` are either both present or both absent.
+fn validate_campaign_fields(a: &AttackActivity) -> Result<()> {
+    match (&a.campaign_id, a.step) {
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        (Some(_), None) => bail!(
+            "attack activity '{}' has campaign_id but missing step",
+            a.name,
+        ),
+        (None, Some(_)) => bail!(
+            "attack activity '{}' has step but missing campaign_id",
+            a.name,
+        ),
+    }
+}
+
+/// Validates that campaign steps start at 1, are contiguous, and that
+/// `start_offsets` are non-decreasing within each campaign.
+fn validate_campaign_steps(attacks: &[AttackActivity]) -> Result<()> {
+    let mut campaigns: HashMap<&str, Vec<(u32, &AttackActivity)>> = HashMap::new();
+    for a in attacks {
+        if let (Some(cid), Some(step)) = (&a.campaign_id, a.step) {
+            campaigns.entry(cid.as_str()).or_default().push((step, a));
+        }
+    }
+
+    for (cid, mut steps) in campaigns {
+        steps.sort_unstable_by_key(|(s, _)| *s);
+
+        for (i, (step, a)) in steps.iter().enumerate() {
+            let expected = u32::try_from(i + 1).context("campaign step count exceeds u32 range")?;
+            ensure!(
+                *step == expected,
+                "campaign '{cid}': expected step {expected} but activity '{}' has step {step}",
+                a.name,
+            );
+        }
+
+        for pair in steps.windows(2) {
+            let (_, a) = &pair[0];
+            let (_, b) = &pair[1];
+            let off_a = parse_duration(&a.start_offset)?;
+            let off_b = parse_duration(&b.start_offset)?;
+            ensure!(
+                off_a <= off_b,
+                "campaign '{cid}': step {} (offset {}) must not start after step {} (offset {})",
+                pair[0].0,
+                a.start_offset,
+                pair[1].0,
+                b.start_offset,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 impl Scenario {
     /// Validates semantic constraints that serde cannot enforce.
+    #[allow(clippy::too_many_lines)] // validation steps are inherently sequential
     fn validate(&self) -> Result<()> {
         ensure!(
             self.version == SUPPORTED_VERSION,
@@ -379,7 +440,10 @@ impl Scenario {
         }
         for a in &self.activities.attack {
             validate_host_refs(&host_names, "attack", &a.name, &a.source, &a.target)?;
+            validate_campaign_fields(a)?;
         }
+
+        validate_campaign_steps(&self.activities.attack)?;
 
         Ok(())
     }
@@ -1478,5 +1542,199 @@ activities:
     fn accept_vm_host_in_single_segment() {
         let s: Scenario = serde_yaml::from_str(AC2_YAML).unwrap();
         s.validate().unwrap();
+    }
+
+    // ── Campaign validation ──────────────────────────────────────
+
+    const AC0_CAMPAIGN_YAML: &str = include_str!("../scenarios/ac-0-campaign.scenario.yaml");
+
+    #[test]
+    fn ac0_campaign_parses_and_validates() {
+        let s: Scenario = serde_yaml::from_str(AC0_CAMPAIGN_YAML).unwrap();
+        s.validate().unwrap();
+        assert_eq!(s.activities.attack.len(), 2);
+        assert_eq!(
+            s.activities.attack[0].campaign_id.as_deref(),
+            Some("campaign-001"),
+        );
+        assert_eq!(s.activities.attack[0].step, Some(1));
+        assert_eq!(s.activities.attack[1].step, Some(2));
+    }
+
+    #[test]
+    fn campaign_fields_default_to_none() {
+        let s: Scenario = serde_yaml::from_str(AC0_YAML).unwrap();
+        assert!(s.activities.attack[0].campaign_id.is_none());
+        assert!(s.activities.attack[0].step.is_none());
+    }
+
+    #[test]
+    fn reject_campaign_id_without_step() {
+        let yaml = yaml_with_activities(
+            "  attack:
+    - name: bad
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 0s
+      campaign_id: c1
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("has campaign_id but missing step"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_step_without_campaign_id() {
+        let yaml = yaml_with_activities(
+            "  attack:
+    - name: bad
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 0s
+      step: 1
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("has step but missing campaign_id"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_campaign_with_gap_in_steps() {
+        let yaml = yaml_with_activities(
+            "  attack:
+    - name: step1
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 0s
+      campaign_id: c1
+      step: 1
+    - name: step3
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 10s
+      campaign_id: c1
+      step: 3
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("expected step 2"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_campaign_with_decreasing_offsets() {
+        let yaml = yaml_with_activities(
+            "  attack:
+    - name: step1
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 60s
+      campaign_id: c1
+      step: 1
+    - name: step2
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 30s
+      campaign_id: c1
+      step: 2
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must not start after"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn accept_campaign_with_equal_offsets() {
+        let yaml = yaml_with_activities(
+            "  attack:
+    - name: step1
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 60s
+      campaign_id: c1
+      step: 1
+    - name: step2
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      technique: T0000
+      phase: reconnaissance
+      tool: test
+      start_offset: 60s
+      campaign_id: c1
+      step: 2
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn load_ac0_campaign_from_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-0-campaign.scenario.yaml");
+        let s = load(&path).unwrap();
+        assert_eq!(s.metadata.name, "ac-0-campaign");
+        assert_eq!(s.activities.attack.len(), 2);
     }
 }

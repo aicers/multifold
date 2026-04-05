@@ -1,0 +1,72 @@
+version: "1"
+
+metadata:
+  name: ac-0-campaign
+  description: >-
+    Two-step campaign variant of AC-0. Same minimal infrastructure with
+    one normal activity and a two-step attack campaign: nmap port scan
+    (reconnaissance) followed by curl-based data exfiltration.
+
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+
+duration: 5m
+
+infrastructure:
+  hosts:
+    - name: attacker-001
+      os: linux
+      role: attacker
+      image: alpine:3.19
+    - name: target-001
+      os: linux
+      role: target
+      image: alpine:3.19
+      setup:
+        - "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 80 > /dev/null; done &"
+  network:
+    segments:
+      - name: lan
+        subnet: 10.100.0.0/24
+        hosts:
+          - attacker-001
+          - target-001
+
+activities:
+  normal:
+    - name: http-health-check
+      source: attacker-001
+      target: target-001
+      command: "curl -s http://${target_ip}:80/"
+      protocol: tcp
+      dst_port: 80
+      start_offset: 30s
+  attack:
+    - name: recon-port-scan
+      source: attacker-001
+      target: target-001
+      command: "nmap -sS -p 80 ${target_ip}"
+      protocol: tcp
+      dst_port: 80
+      technique: T1046
+      phase: reconnaissance
+      tool: nmap
+      start_offset: 120s
+      campaign_id: campaign-001
+      step: 1
+    - name: exfil-curl
+      source: attacker-001
+      target: target-001
+      command: "curl -s http://${target_ip}:80/"
+      protocol: tcp
+      dst_port: 80
+      technique: T1048
+      phase: exfiltration
+      tool: curl
+      start_offset: 180s
+      campaign_id: campaign-001
+      step: 2

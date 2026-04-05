@@ -31,6 +31,10 @@ struct Record {
     phase: Option<Phase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<u32>,
 }
 
 /// Writes ground-truth records to `ground_truth/manifest.jsonl` inside
@@ -42,14 +46,16 @@ pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
     let mut writer = BufWriter::new(file);
 
     for exec in executions {
-        let (label, category, technique, phase, tool) = match &exec.attack {
-            None => ("normal", None, None, None, None),
+        let (label, category, technique, phase, tool, campaign_id, step) = match &exec.attack {
+            None => ("normal", None, None, None, None, None, None),
             Some(detail) => (
                 "anomaly",
                 Some("attack"),
                 Some(detail.technique.clone()),
                 Some(detail.phase),
                 Some(detail.tool.clone()),
+                detail.campaign_id.clone(),
+                detail.step,
             ),
         };
 
@@ -70,6 +76,8 @@ pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
             technique,
             phase,
             tool,
+            campaign_id,
+            step,
         };
 
         let json =
@@ -130,6 +138,8 @@ mod tests {
                 technique: "T1046".to_owned(),
                 phase: Phase::Reconnaissance,
                 tool: "nmap".to_owned(),
+                campaign_id: None,
+                step: None,
             }),
             exit_code: 0,
             command: String::new(),
@@ -343,6 +353,125 @@ mod tests {
     }
 
     // ── phase variants ────────────────────────────────────────────
+
+    // ── campaign records ────────────────────────────────────────
+
+    fn campaign_step1() -> Execution {
+        Execution {
+            start: chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 2, 0).unwrap(),
+            end: chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 2, 1).unwrap(),
+            source: "attacker-001".to_owned(),
+            target: "target-001".to_owned(),
+            protocol: Protocol::Tcp,
+            src_ip: Ipv4Addr::new(10, 100, 0, 2),
+            src_port: 50000,
+            dst_ip: Ipv4Addr::new(10, 100, 0, 3),
+            dst_port: 80,
+            attack: Some(AttackDetail {
+                technique: "T1046".to_owned(),
+                phase: Phase::Reconnaissance,
+                tool: "nmap".to_owned(),
+                campaign_id: Some("campaign-001".to_owned()),
+                step: Some(1),
+            }),
+            exit_code: 0,
+            command: String::new(),
+        }
+    }
+
+    fn campaign_step2() -> Execution {
+        Execution {
+            start: chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 3, 0).unwrap(),
+            end: chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 3, 1).unwrap(),
+            source: "attacker-001".to_owned(),
+            target: "target-001".to_owned(),
+            protocol: Protocol::Tcp,
+            src_ip: Ipv4Addr::new(10, 100, 0, 2),
+            src_port: 50001,
+            dst_ip: Ipv4Addr::new(10, 100, 0, 3),
+            dst_port: 80,
+            attack: Some(AttackDetail {
+                technique: "T1048".to_owned(),
+                phase: Phase::Exfiltration,
+                tool: "curl".to_owned(),
+                campaign_id: Some("campaign-001".to_owned()),
+                step: Some(2),
+            }),
+            exit_code: 0,
+            command: String::new(),
+        }
+    }
+
+    #[test]
+    fn campaign_record_includes_campaign_fields() {
+        let content = write_and_read(&[campaign_step1()]);
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(record["campaign_id"], "campaign-001");
+        assert_eq!(record["step"], 1);
+    }
+
+    #[test]
+    fn campaign_record_field_order_matches_v1_schema() {
+        let content = write_and_read(&[campaign_step1()]);
+        let raw = content.trim();
+
+        let expected_order = [
+            "scope",
+            "label",
+            "start",
+            "end",
+            "source",
+            "target",
+            "session_type",
+            "protocol",
+            "src_ip",
+            "src_port",
+            "dst_ip",
+            "dst_port",
+            "category",
+            "technique",
+            "phase",
+            "tool",
+            "campaign_id",
+            "step",
+        ];
+        let mut last_pos = 0;
+        for key in &expected_order {
+            let pattern = format!("\"{key}\":");
+            let pos = raw.find(&pattern).unwrap_or_else(|| {
+                panic!("field '{key}' not found in record: {raw}");
+            });
+            assert!(
+                pos >= last_pos,
+                "field '{key}' at {pos} appears before previous field at {last_pos}: {raw}",
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn non_campaign_attack_omits_campaign_fields() {
+        let content = write_and_read(&[attack_execution()]);
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert!(record.get("campaign_id").is_none());
+        assert!(record.get("step").is_none());
+    }
+
+    #[test]
+    fn two_step_campaign_produces_two_records() {
+        let content = write_and_read(&[campaign_step1(), campaign_step2()]);
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let r0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let r1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r0["campaign_id"], "campaign-001");
+        assert_eq!(r0["step"], 1);
+        assert_eq!(r1["campaign_id"], "campaign-001");
+        assert_eq!(r1["step"], 2);
+    }
+
+    // ── phase variants ────────────────────────────────────────
 
     #[test]
     fn write_serializes_all_phase_variants() {

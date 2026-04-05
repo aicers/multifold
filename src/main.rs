@@ -384,6 +384,8 @@ mod tests {
                 technique: "T1046".into(),
                 phase: scenario::Phase::Reconnaissance,
                 tool: "nmap".into(),
+                campaign_id: None,
+                step: None,
             }),
         )];
 
@@ -435,6 +437,8 @@ mod tests {
                     technique: "T1046".into(),
                     phase: scenario::Phase::Reconnaissance,
                     tool: "nmap".into(),
+                    campaign_id: None,
+                    step: None,
                 }),
             ),
         ];
