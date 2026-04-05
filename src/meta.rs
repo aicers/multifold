@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::scenario::{self, Attacker, Encryption, Os, Role, Scale, Scenario, Threat, Workload};
+use crate::scenario::{
+    self, Attacker, Encryption, Os, Role, Scale, Scenario, Threat, VantagePoint, Workload,
+};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -103,7 +105,8 @@ fn build(
                 .iter()
                 .map(|s| MetaPcapEntry {
                     segment: s.name.clone(),
-                    path: format!("net/capture-{}.pcap", s.name),
+                    path: format!("net/{}.pcap", s.name),
+                    vantage_point: s.vantage_point,
                 })
                 .collect(),
         },
@@ -174,6 +177,8 @@ struct MetaCapture {
 struct MetaPcapEntry {
     segment: String,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vantage_point: Option<VantagePoint>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,7 +231,7 @@ mod tests {
         assert_eq!(meta.network.segments[0].name, "lan");
         assert_eq!(meta.capture.pcaps.len(), 1);
         assert_eq!(meta.capture.pcaps[0].segment, "lan");
-        assert_eq!(meta.capture.pcaps[0].path, "net/capture-lan.pcap");
+        assert_eq!(meta.capture.pcaps[0].path, "net/lan.pcap");
     }
 
     #[test]
@@ -240,7 +245,7 @@ mod tests {
         assert_eq!(value["hosts"][1]["ips"][0], "10.100.0.3");
         assert_eq!(value["environment"]["scale"], "minimal");
         assert_eq!(value["capture"]["pcaps"][0]["segment"], "lan");
-        assert_eq!(value["capture"]["pcaps"][0]["path"], "net/capture-lan.pcap");
+        assert_eq!(value["capture"]["pcaps"][0]["path"], "net/lan.pcap");
     }
 
     #[test]
@@ -289,5 +294,82 @@ mod tests {
             err.to_string().contains("not found in scenario"),
             "unexpected error: {err}",
         );
+    }
+
+    #[test]
+    fn build_meta_omits_vantage_point_when_absent() {
+        let (scenario, host_ips, start) = ac0_test_inputs();
+        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            value["capture"]["pcaps"][0].get("vantage_point").is_none(),
+            "vantage_point should be omitted when not set",
+        );
+    }
+
+    fn ac2_tls_test_inputs() -> (Scenario, HostIps, DateTime<Utc>) {
+        let yaml = include_str!("../scenarios/ac-2-tls.scenario.yaml");
+        let scenario: Scenario = serde_yaml::from_str(yaml).unwrap();
+        let host_ips = vec![
+            (
+                "attacker-001".to_owned(),
+                vec![Ipv4Addr::new(10, 200, 0, 2)],
+            ),
+            (
+                "proxy-001".to_owned(),
+                vec![Ipv4Addr::new(10, 200, 0, 3), Ipv4Addr::new(10, 200, 1, 2)],
+            ),
+            ("backend-001".to_owned(), vec![Ipv4Addr::new(10, 200, 1, 3)]),
+        ];
+        let start = DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        (scenario, host_ips, start)
+    }
+
+    #[test]
+    fn build_meta_includes_vantage_points() {
+        let (scenario, host_ips, start) = ac2_tls_test_inputs();
+        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let pcaps = value["capture"]["pcaps"].as_array().unwrap();
+        assert_eq!(pcaps.len(), 2);
+
+        assert_eq!(pcaps[0]["segment"], "edge");
+        assert_eq!(pcaps[0]["path"], "net/edge.pcap");
+        assert_eq!(pcaps[0]["vantage_point"], "pre_tls_termination");
+
+        assert_eq!(pcaps[1]["segment"], "inner");
+        assert_eq!(pcaps[1]["path"], "net/inner.pcap");
+        assert_eq!(pcaps[1]["vantage_point"], "post_tls_termination");
+    }
+
+    #[test]
+    fn build_meta_tls_has_correct_encryption() {
+        let (scenario, host_ips, start) = ac2_tls_test_inputs();
+        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["environment"]["encryption"], "tls");
+    }
+
+    #[test]
+    fn build_meta_tls_segments_have_subnets() {
+        let (scenario, host_ips, start) = ac2_tls_test_inputs();
+        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let segments = value["network"]["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["name"], "edge");
+        assert_eq!(segments[0]["subnet"], "10.200.0.0/24");
+        assert_eq!(segments[1]["name"], "inner");
+        assert_eq!(segments[1]["subnet"], "10.200.1.0/24");
     }
 }

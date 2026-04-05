@@ -1223,7 +1223,7 @@ mod tests {
         fs::create_dir_all(dir.join("host/target-001")).unwrap();
         fs::write(dir.join("meta.json"), meta_json()).unwrap();
         fs::write(dir.join("ground_truth/manifest.jsonl"), gt_content()).unwrap();
-        fs::write(dir.join("net/capture-lan.pcap"), synthetic_pcap()).unwrap();
+        fs::write(dir.join("net/lan.pcap"), synthetic_pcap()).unwrap();
     }
 
     fn find_check<'a>(report: &'a Report, id: &str) -> Option<&'a Check> {
@@ -1337,7 +1337,7 @@ mod tests {
     fn missing_pcap_fails_l1_003() {
         let dir = tempfile::tempdir().unwrap();
         create_valid_bundle(dir.path());
-        fs::remove_file(dir.path().join("net/capture-lan.pcap")).unwrap();
+        fs::remove_file(dir.path().join("net/lan.pcap")).unwrap();
         let report = run(dir.path()).unwrap();
         assert_fail(&report, "L1-003");
     }
@@ -1391,7 +1391,7 @@ mod tests {
     fn invalid_pcap_magic_fails_l2_004() {
         let dir = tempfile::tempdir().unwrap();
         create_valid_bundle(dir.path());
-        fs::write(dir.path().join("net/capture-lan.pcap"), [0u8; 24]).unwrap();
+        fs::write(dir.path().join("net/lan.pcap"), [0u8; 24]).unwrap();
         let report = run(dir.path()).unwrap();
         assert_pass(&report, "L1-003");
         assert_fail(&report, "L2-004");
@@ -1547,7 +1547,7 @@ mod tests {
             src_port: 49152,
             dst_port: 80,
         }]);
-        fs::write(dir.path().join("net/capture-lan.pcap"), data).unwrap();
+        fs::write(dir.path().join("net/lan.pcap"), data).unwrap();
         let report = run(dir.path()).unwrap();
         assert_fail(&report, "L4-001");
     }
@@ -1564,7 +1564,7 @@ mod tests {
             src_port: 49152,
             dst_port: 443,
         }]);
-        fs::write(dir.path().join("net/capture-lan.pcap"), data).unwrap();
+        fs::write(dir.path().join("net/lan.pcap"), data).unwrap();
         let report = run(dir.path()).unwrap();
         assert_fail(&report, "L4-001");
     }
@@ -1573,11 +1573,7 @@ mod tests {
     fn empty_pcap_fails_l4_001() {
         let dir = tempfile::tempdir().unwrap();
         create_valid_bundle(dir.path());
-        fs::write(
-            dir.path().join("net/capture-lan.pcap"),
-            pcap_global_header(),
-        )
-        .unwrap();
+        fs::write(dir.path().join("net/lan.pcap"), pcap_global_header()).unwrap();
         let report = run(dir.path()).unwrap();
         assert_fail(&report, "L4-001");
     }
@@ -1980,7 +1976,7 @@ mod tests {
             campaign_gt_content(),
         )
         .unwrap();
-        fs::write(dir.join("net/capture-lan.pcap"), campaign_pcap()).unwrap();
+        fs::write(dir.join("net/lan.pcap"), campaign_pcap()).unwrap();
     }
 
     #[test]

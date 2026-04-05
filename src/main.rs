@@ -327,7 +327,7 @@ mod tests {
         let ts: i64 = 1_737_000_030;
         write_synthetic_pcap(
             &dir.path().join("net"),
-            "capture-lan.pcap",
+            "lan.pcap",
             &[(u32::try_from(ts).unwrap(), 49152)],
         );
 
@@ -372,7 +372,7 @@ mod tests {
         let ts: i64 = 1_737_000_120;
         write_synthetic_pcap(
             &dir.path().join("net"),
-            "capture-lan.pcap",
+            "lan.pcap",
             &[(u32::try_from(ts).unwrap(), 50000)],
         );
 
@@ -420,7 +420,7 @@ mod tests {
         let ts_attack: i64 = 1_737_000_120;
         write_synthetic_pcap(
             &dir.path().join("net"),
-            "capture-lan.pcap",
+            "lan.pcap",
             &[
                 (u32::try_from(ts_normal).unwrap(), 49152),
                 (u32::try_from(ts_attack).unwrap(), 50000),
@@ -549,7 +549,7 @@ mod tests {
         assert!(output_dir.join("host/target-001").is_dir());
 
         // ── PCAP present and non-empty ───────────────────────────
-        let pcap_path = output_dir.join("net/capture-lan.pcap");
+        let pcap_path = output_dir.join("net/lan.pcap");
         assert!(pcap_path.exists(), "pcap file was not created");
         let pcap_len = fs::metadata(&pcap_path).unwrap().len();
         assert!(pcap_len > 24, "pcap must be larger than the global header");
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(meta["network"]["segments"][0]["name"], "lan");
         assert_eq!(meta["network"]["segments"][0]["subnet"], subnet);
         assert_eq!(meta["capture"]["pcaps"][0]["segment"], "lan");
-        assert_eq!(meta["capture"]["pcaps"][0]["path"], "net/capture-lan.pcap",);
+        assert_eq!(meta["capture"]["pcaps"][0]["path"], "net/lan.pcap",);
 
         // ── ground_truth/manifest.jsonl ──────────────────────────
         let gt_path = output_dir.join("ground_truth/manifest.jsonl");

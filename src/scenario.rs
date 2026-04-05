@@ -133,6 +133,8 @@ pub(crate) struct Segment {
     pub(crate) name: String,
     pub(crate) subnet: String,
     pub(crate) hosts: Vec<String>,
+    #[serde(default)]
+    pub(crate) vantage_point: Option<VantagePoint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +233,13 @@ pub(crate) enum Protocol {
     Tcp,
     Udp,
     Icmp,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VantagePoint {
+    PreTlsTermination,
+    PostTlsTermination,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -1736,5 +1745,57 @@ activities:
         let s = load(&path).unwrap();
         assert_eq!(s.metadata.name, "ac-0-campaign");
         assert_eq!(s.activities.attack.len(), 2);
+    }
+
+    // ── Vantage point ────────────────────────────────────────────
+
+    #[test]
+    fn vantage_point_defaults_to_none() {
+        let s: Scenario = serde_yaml::from_str(AC0_YAML).unwrap();
+        assert!(
+            s.infrastructure.network.segments[0].vantage_point.is_none(),
+            "segments without vantage_point should default to None",
+        );
+    }
+
+    #[test]
+    fn load_ac2_tls_from_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-2-tls.scenario.yaml");
+        let s = load(&path).unwrap();
+        assert_eq!(s.metadata.name, "ac-2-tls");
+        assert_eq!(s.environment.encryption, Encryption::Tls);
+        assert_eq!(s.infrastructure.hosts.len(), 3);
+        assert_eq!(s.infrastructure.network.segments.len(), 2);
+    }
+
+    #[test]
+    fn ac2_tls_vantage_points() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-2-tls.scenario.yaml");
+        let s = load(&path).unwrap();
+
+        let edge = &s.infrastructure.network.segments[0];
+        assert_eq!(edge.name, "edge");
+        assert_eq!(edge.vantage_point, Some(VantagePoint::PreTlsTermination));
+
+        let inner = &s.infrastructure.network.segments[1];
+        assert_eq!(inner.name, "inner");
+        assert_eq!(inner.vantage_point, Some(VantagePoint::PostTlsTermination),);
+    }
+
+    #[test]
+    fn ac2_tls_proxy_is_multi_homed() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-2-tls.scenario.yaml");
+        let s = load(&path).unwrap();
+
+        let edge_hosts = &s.infrastructure.network.segments[0].hosts;
+        let internal_hosts = &s.infrastructure.network.segments[1].hosts;
+        assert!(edge_hosts.contains(&"proxy-001".to_owned()));
+        assert!(internal_hosts.contains(&"proxy-001".to_owned()));
     }
 }

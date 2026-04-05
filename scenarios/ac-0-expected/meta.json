@@ -41,7 +41,7 @@
     "pcaps": [
       {
         "segment": "lan",
-        "path": "net/capture-lan.pcap"
+        "path": "net/lan.pcap"
       }
     ]
   }
