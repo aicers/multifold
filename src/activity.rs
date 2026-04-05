@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use tokio::task::JoinSet;
 
 use crate::scenario::{Activities, Host, Phase, Protocol, parse_duration};
+use crate::vm::{self, ProvisionedVm};
 
 /// Seconds to wait after the last activity so trailing packets reach
 /// the tcpdump capture containers.
@@ -55,49 +56,88 @@ struct AttackRef<'a> {
 
 /// Runs per-host setup commands before any activities start.
 ///
-/// Each command runs sequentially inside the host's container and must
-/// exit with code 0.  Typical use: start a background service (e.g.
-/// `busybox httpd`) that activities will target.
+/// Each command runs sequentially inside the host's container (or via
+/// SSH for VM hosts) and must exit with code 0.  Typical use: start a
+/// background service (e.g. `busybox httpd`) that activities will
+/// target.
 pub(crate) async fn run_setup(
     docker: &Docker,
     hosts: &[Host],
     host_containers: &[(String, String)],
+    vms: &[ProvisionedVm],
 ) -> Result<()> {
     for host in hosts {
         if host.setup.is_empty() {
             continue;
         }
-        let container_id = lookup_container(host_containers, &host.name)?;
-        for cmd in &host.setup {
-            println!("  Setup {}: {cmd}", host.name);
-            let code = exec_in_container(docker, container_id, cmd)
+
+        if host.is_vm() {
+            let vm_host = lookup_vm(vms, &host.name)?;
+            for cmd in &host.setup {
+                println!("  Setup {} (VM): {cmd}", host.name);
+                let code = vm::exec_ssh(
+                    &vm_host.mgmt_ip,
+                    &vm_host.ssh_user,
+                    &vm_host.ssh_password,
+                    cmd,
+                )
                 .await
-                .with_context(|| format!("setup command failed in '{}'", host.name))?;
-            anyhow::ensure!(
-                code == 0,
-                "setup command failed in '{}' (exit code {code}): {cmd}",
-                host.name,
-            );
+                .with_context(|| format!("setup command failed in VM '{}'", host.name))?;
+                anyhow::ensure!(
+                    code == 0,
+                    "setup command failed in VM '{}' (exit code {code}): {cmd}",
+                    host.name,
+                );
+            }
+        } else {
+            let container_id = lookup_container(host_containers, &host.name)?;
+            for cmd in &host.setup {
+                println!("  Setup {}: {cmd}", host.name);
+                let code = exec_in_container(docker, container_id, cmd)
+                    .await
+                    .with_context(|| format!("setup command failed in '{}'", host.name))?;
+                anyhow::ensure!(
+                    code == 0,
+                    "setup command failed in '{}' (exit code {code}): {cmd}",
+                    host.name,
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Backend for executing a command during an activity.
+enum ExecBackend {
+    /// Docker container identified by container ID.
+    Docker {
+        docker: Docker,
+        container_id: String,
+    },
+    /// Libvirt VM reached via SSH.
+    Ssh {
+        mgmt_ip: Ipv4Addr,
+        ssh_user: String,
+        ssh_password: String,
+    },
 }
 
 /// Executes all activities concurrently and returns execution results.
 ///
 /// Each activity is spawned as an independent task that sleeps until its
 /// `start_offset` elapses, then executes the command inside the source
-/// host's container via Docker exec.  This ensures activities with the
-/// same offset (or whose offset has already passed) start without waiting
-/// for earlier commands to finish.  Tool packages (curl, nmap) are
-/// installed before any activity runs.
+/// host's container via Docker exec (or via SSH for VM hosts).  Tool
+/// packages (curl, nmap) are installed in container-based sources
+/// before any activity runs.
 pub(crate) async fn run(
     docker: &Docker,
     host_containers: &[(String, String)],
     host_ips: &[(String, Vec<Ipv4Addr>)],
     activities: &Activities,
     generation_start: DateTime<Utc>,
+    vms: &[ProvisionedVm],
 ) -> Result<Vec<Execution>> {
+    // Install tools only in Docker-based activity sources.
     let sources = activity_sources(activities);
     let source_containers: Vec<_> = host_containers
         .iter()
@@ -109,25 +149,21 @@ pub(crate) async fn run(
     let mut schedule = build_schedule(activities)?;
     schedule.sort_unstable_by_key(|s| s.offset);
 
-    // Resolve IPs and container IDs upfront so errors surface early.
+    // Resolve IPs and execution backend upfront so errors surface early.
     let prepared: Vec<_> = schedule
         .iter()
         .map(|a| {
             let src_ip = lookup_ip(host_ips, a.source)?;
             let dst_ip = lookup_ip(host_ips, a.target)?;
             let command = a.command.replace("${target_ip}", &dst_ip.to_string());
-            let container_id = lookup_container(host_containers, a.source)?;
-            Ok((a, src_ip, dst_ip, command, container_id.to_owned()))
+            let backend = resolve_backend(docker, host_containers, vms, a.source)?;
+            Ok((a, src_ip, dst_ip, command, backend))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Spawn each activity as an independent task. Each task sleeps
-    // until its scheduled offset, then executes the command.  This
-    // ensures activities whose offsets have already elapsed (or share
-    // the same offset) start without waiting for earlier execs.
+    // Spawn each activity as an independent task.
     let mut tasks = JoinSet::new();
-    for (activity, src_ip, dst_ip, command, container_id) in prepared {
-        let docker = docker.clone();
+    for (activity, src_ip, dst_ip, command, backend) in prepared {
         let target_time = generation_start + activity.offset;
         let source = activity.source.to_owned();
         let target = activity.target.to_owned();
@@ -144,9 +180,21 @@ pub(crate) async fn run(
 
             println!("  Executing: {command}");
             let start = Utc::now();
-            let exit_code = exec_in_container(&docker, &container_id, &command)
-                .await
-                .with_context(|| format!("activity exec failed in '{source}'"))?;
+            let exit_code = match &backend {
+                ExecBackend::Docker {
+                    docker,
+                    container_id,
+                } => exec_in_container(docker, container_id, &command)
+                    .await
+                    .with_context(|| format!("activity exec failed in '{source}'"))?,
+                ExecBackend::Ssh {
+                    mgmt_ip,
+                    ssh_user,
+                    ssh_password,
+                } => vm::exec_ssh(mgmt_ip, ssh_user, ssh_password, &command)
+                    .await
+                    .with_context(|| format!("activity SSH exec failed in '{source}'"))?,
+            };
             let end = Utc::now();
 
             if exit_code != 0 {
@@ -180,6 +228,29 @@ pub(crate) async fn run(
     tokio::time::sleep(std::time::Duration::from_secs(CAPTURE_DRAIN_SECS)).await;
 
     Ok(results)
+}
+
+/// Resolves the execution backend for a given source host.
+fn resolve_backend(
+    docker: &Docker,
+    host_containers: &[(String, String)],
+    vms: &[ProvisionedVm],
+    source: &str,
+) -> Result<ExecBackend> {
+    // Check VMs first.
+    if let Some(vm_host) = vms.iter().find(|v| v.host_name == source) {
+        return Ok(ExecBackend::Ssh {
+            mgmt_ip: vm_host.mgmt_ip,
+            ssh_user: vm_host.ssh_user.clone(),
+            ssh_password: vm_host.ssh_password.clone(),
+        });
+    }
+    // Fall back to Docker container.
+    let container_id = lookup_container(host_containers, source)?;
+    Ok(ExecBackend::Docker {
+        docker: docker.clone(),
+        container_id: container_id.to_owned(),
+    })
 }
 
 fn build_schedule(activities: &Activities) -> Result<Vec<Scheduled<'_>>> {
@@ -241,6 +312,12 @@ fn lookup_container<'a>(host_containers: &'a [(String, String)], host: &str) -> 
         .find(|(name, _)| name == host)
         .map(|(_, id)| id.as_str())
         .with_context(|| format!("no container found for host '{host}'"))
+}
+
+fn lookup_vm<'a>(vms: &'a [ProvisionedVm], host: &str) -> Result<&'a ProvisionedVm> {
+    vms.iter()
+        .find(|v| v.host_name == host)
+        .with_context(|| format!("no VM found for host '{host}'"))
 }
 
 /// Returns the set of host names that appear as activity sources.
@@ -653,6 +730,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -746,6 +824,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -840,6 +919,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -899,6 +979,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -948,6 +1029,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -1051,6 +1133,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -1098,6 +1181,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             past_start,
+            &[],
         )
         .await
         .unwrap();
@@ -1183,6 +1267,7 @@ mod tests {
             &env.host_ips,
             &scenario.activities,
             start,
+            &[],
         )
         .await
         .unwrap();

@@ -3,7 +3,7 @@ use std::hash::Hasher;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, NetworkingConfig, RemoveContainerOptions,
@@ -15,11 +15,12 @@ use futures_util::TryStreamExt;
 use ipnet::Ipv4Net;
 
 use crate::scenario::Scenario;
+use crate::vm;
 
 const CAPTURE_IMAGE: &str = "alpine:3.19";
 const LINUX_IFNAMSIZ: usize = 15;
 
-/// Holds provisioned Docker resources and assigned host IPs.
+/// Holds provisioned Docker resources, VMs, and assigned host IPs.
 ///
 /// Each entry in `host_ips` maps a host name to **all** IPs assigned
 /// across every segment the host belongs to (primary first).
@@ -30,6 +31,8 @@ pub(crate) struct ProvisionedEnv {
     capture_container_ids: Vec<String>,
     pub(crate) host_ips: Vec<(String, Vec<Ipv4Addr>)>,
     pub(crate) host_containers: Vec<(String, String)>,
+    /// Provisioned libvirt VMs (Windows hosts).
+    pub(crate) vms: Vec<vm::ProvisionedVm>,
 }
 
 /// Per-segment state accumulated during provisioning.
@@ -116,6 +119,7 @@ impl ProvisionedEnv {
             capture_container_ids: Vec::new(),
             host_ips: Vec::new(),
             host_containers: Vec::new(),
+            vms: Vec::new(),
         };
 
         let run_id = generate_run_id();
@@ -144,6 +148,7 @@ impl ProvisionedEnv {
         self.teardown_inner().await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn setup(&mut self, scenario: &Scenario, pcap_dir: &Path, run_id: &str) -> Result<()> {
         let prefix = format!("{}-{run_id}", scenario.metadata.name);
         let mut pulled: HashSet<String> = HashSet::new();
@@ -165,26 +170,44 @@ impl ProvisionedEnv {
         }
 
         // Phase 2: Create host containers (once each) and connect
-        // multi-homed hosts to additional networks.
+        // multi-homed hosts to additional networks.  VM hosts are
+        // skipped here and provisioned in Phase 4.
         let mut created: HashMap<String, String> = HashMap::new();
+        let mut vm_seen: HashSet<String> = HashSet::new();
         for state in &segments {
             for (host_name, ip) in &state.ips {
+                // Multi-homed Docker host.
                 if let Some(container_id) = created.get(host_name) {
                     connect_container(&self.docker, &state.net_name, container_id, *ip).await?;
-                    // Record the secondary IP for this multi-homed host.
                     if let Some((_, ips)) =
                         self.host_ips.iter_mut().find(|(name, _)| name == host_name)
                     {
                         ips.push(*ip);
                     }
-                } else {
-                    let host = scenario
-                        .infrastructure
-                        .hosts
-                        .iter()
-                        .find(|h| h.name == *host_name)
-                        .with_context(|| format!("host '{host_name}' not in scenario"))?;
+                    continue;
+                }
 
+                // Scenario validation rejects VM hosts in multiple
+                // segments, so this is unreachable in normal use.
+                if vm_seen.contains(host_name) {
+                    bail!(
+                        "VM host '{host_name}' appears in multiple segments; \
+                         multi-segment VM provisioning is not yet supported"
+                    );
+                }
+
+                let host = scenario
+                    .infrastructure
+                    .hosts
+                    .iter()
+                    .find(|h| h.name == *host_name)
+                    .with_context(|| format!("host '{host_name}' not in scenario"))?;
+
+                if host.is_vm() {
+                    // Track the VM host; actual provisioning in Phase 4.
+                    vm_seen.insert(host_name.clone());
+                    self.host_ips.push((host_name.clone(), vec![*ip]));
+                } else {
                     if pulled.insert(host.image.clone()) {
                         pull_image(&self.docker, &host.image).await?;
                     }
@@ -238,10 +261,52 @@ impl ProvisionedEnv {
             self.capture_container_ids.push(capture_id);
         }
 
+        // Phase 4: Provision libvirt VMs for Windows hosts.
+        for host in &scenario.infrastructure.hosts {
+            let Some(vm_config) = &host.vm else {
+                continue;
+            };
+
+            // Find the primary segment and bridge for this VM.
+            let (seg_name, bridge, test_ip, subnet) = segments
+                .iter()
+                .zip(&scenario.infrastructure.network.segments)
+                .find_map(|(state, seg)| {
+                    state
+                        .ips
+                        .iter()
+                        .find(|(name, _)| *name == host.name)
+                        .map(|(_, ip)| (seg.name.clone(), state.bridge.clone(), *ip, &seg.subnet))
+                })
+                .with_context(|| format!("VM host '{}' not found in any segment", host.name))?;
+
+            let net: ipnet::Ipv4Net = subnet
+                .parse()
+                .with_context(|| format!("invalid subnet '{}' for VM '{}'", subnet, host.name))?;
+            let prefix_len = net.prefix_len();
+            let gateway = Ipv4Addr::from(u32::from(net.network()) + 1);
+
+            println!("  Provisioning VM '{}' on segment '{seg_name}'…", host.name);
+            let provisioned_vm = vm::create_vm(
+                &host.name, vm_config, &prefix, &bridge, test_ip, prefix_len, gateway,
+            )
+            .await?;
+            println!(
+                "  VM '{}' ready (mgmt: {}, test: {test_ip})",
+                host.name, provisioned_vm.mgmt_ip,
+            );
+            self.vms.push(provisioned_vm);
+        }
+
         Ok(())
     }
 
     async fn teardown_inner(&self) -> Result<()> {
+        // Destroy VMs first.
+        for provisioned_vm in &self.vms {
+            let _ = vm::destroy_vm(provisioned_vm).await;
+        }
+
         let opts = RemoveContainerOptions {
             force: true,
             ..Default::default()
