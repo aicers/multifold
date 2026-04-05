@@ -35,6 +35,8 @@ const GT_COMMON_REQUIRED: &[&str] = &[
 
 const GT_NETWORK_REQUIRED: &[&str] = &["protocol", "src_ip", "src_port", "dst_ip", "dst_port"];
 
+const GT_PROCESS_REQUIRED: &[&str] = &["host", "pid"];
+
 const VALID_PHASES: &[&str] = &[
     "reconnaissance",
     "initial_access",
@@ -128,6 +130,14 @@ fn fail(id: &'static str, message: impl Into<String>) -> Check {
     }
 }
 
+fn warn(id: &'static str, message: impl Into<String>) -> Check {
+    Check {
+        id,
+        status: Status::Warn,
+        message: message.into(),
+    }
+}
+
 // ── Main entry point ────────────────────────────────────────
 
 /// Validates a dataset bundle and returns a structured report.
@@ -169,6 +179,18 @@ pub(crate) fn run(bundle: &Path) -> Result<Report> {
     // L1-005 + L2-006: host telemetry files
     if let Some(m) = &meta {
         validate_host_telemetry(bundle, m, &mut checks);
+    }
+
+    // L1-006 + L2-008: Windows Sysmon files
+    let sysmon_data = if let Some(m) = &meta {
+        validate_sysmon(bundle, m, &mut checks)
+    } else {
+        Vec::new()
+    };
+
+    // L4-002: GT process records ↔ Sysmon temporal overlap
+    if !gt_records.is_empty() {
+        validate_l4_sysmon(&gt_records, &sysmon_data, &mut checks);
     }
 
     checks.sort_by_key(|c| c.id);
@@ -403,6 +425,7 @@ fn validate_gt_integrity(meta: Option<&Value>, records: &[Value], checks: &mut V
     check_l3_timestamps(records, checks);
     check_l3_sorted(records, checks);
     check_l3_network_fields(records, checks);
+    check_l3_process_fields(records, checks);
     check_l3_anomaly_fields(records, checks);
     check_l3_attack_fields(records, checks);
     check_l3_phases(records, checks);
@@ -480,6 +503,28 @@ fn check_l3_network_fields(records: &[Value], checks: &mut Vec<Check>) {
         checks.push(fail(
             "L3-003",
             format!("missing network fields: {}", missing.join("; ")),
+        ));
+    }
+}
+
+/// L3-004: process sessions have required fields (host, pid).
+fn check_l3_process_fields(records: &[Value], checks: &mut Vec<Check>) {
+    let mut missing = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        if r.get("session_type").and_then(Value::as_str) == Some("process") {
+            for field in GT_PROCESS_REQUIRED {
+                if r.get(*field).is_none() {
+                    missing.push(format!("record {}: missing '{field}'", i + 1));
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        checks.push(pass("L3-004", "all process sessions have required fields"));
+    } else {
+        checks.push(fail(
+            "L3-004",
+            format!("missing process fields: {}", missing.join("; ")),
         ));
     }
 }
@@ -687,10 +732,20 @@ fn validate_host_telemetry(bundle: &Path, meta: &Value, checks: &mut Vec<Check>)
         return;
     }
 
+    // Sysmon files are validated separately via L1-006 / L2-008, so
+    // exclude them here to avoid duplicate (and stricter) checks.
+    let non_sysmon: Vec<_> = entries
+        .iter()
+        .filter(|e| e.get("kind").and_then(Value::as_str) != Some("sysmon"))
+        .collect();
+    if non_sysmon.is_empty() {
+        return;
+    }
+
     // L1-005: all referenced telemetry files exist.
     let mut missing = Vec::new();
     let mut existing_paths = Vec::new();
-    for entry in entries {
+    for entry in &non_sysmon {
         let Some(path_str) = entry.get("path").and_then(Value::as_str) else {
             continue;
         };
@@ -741,6 +796,96 @@ fn validate_host_telemetry(bundle: &Path, meta: &Value, checks: &mut Vec<Check>)
             format!("invalid JSON in telemetry files: {}", bad_files.join(", ")),
         ));
     }
+}
+
+// ── L1-006 + L2-008: Windows Sysmon files ───────────────────
+
+/// Validates that declared Windows hosts have `sysmon.jsonl` files
+/// and that each file contains valid JSON lines.
+///
+/// Returns parsed events per host for downstream L4-002 checking.
+fn validate_sysmon(
+    bundle: &Path,
+    meta: &Value,
+    checks: &mut Vec<Check>,
+) -> Vec<(String, Vec<Value>)> {
+    let Some(host_list) = meta.get("hosts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let windows_hosts: Vec<&str> = host_list
+        .iter()
+        .filter(|h| h.get("os").and_then(Value::as_str) == Some("windows"))
+        .filter_map(|h| h.get("name").and_then(Value::as_str))
+        .collect();
+
+    if windows_hosts.is_empty() {
+        return Vec::new();
+    }
+
+    // L1-006: sysmon.jsonl exists for all Windows hosts.
+    let mut missing = Vec::new();
+    let mut existing = Vec::new();
+    for name in &windows_hosts {
+        let path = bundle.join("host").join(name).join("sysmon.jsonl");
+        if path.is_file() {
+            existing.push(*name);
+        } else {
+            missing.push(*name);
+        }
+    }
+
+    if missing.is_empty() {
+        checks.push(pass(
+            "L1-006",
+            format!("all {} Windows host(s) have sysmon.jsonl", existing.len(),),
+        ));
+    } else {
+        checks.push(fail(
+            "L1-006",
+            format!("missing sysmon.jsonl: {}", missing.join(", ")),
+        ));
+    }
+
+    // L2-008: each sysmon.jsonl contains valid JSON lines.
+    let mut bad_files = Vec::new();
+    let mut host_events = Vec::new();
+    for name in &existing {
+        let path = bundle.join("host").join(name).join("sysmon.jsonl");
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let mut events = Vec::new();
+                let mut bad_count: usize = 0;
+                for line in content.lines().filter(|l| !l.is_empty()) {
+                    match serde_json::from_str::<Value>(line) {
+                        Ok(v) => events.push(v),
+                        Err(_) => bad_count += 1,
+                    }
+                }
+                if bad_count > 0 {
+                    bad_files.push(format!("{name} ({bad_count} bad line(s))"));
+                }
+                host_events.push(((*name).to_owned(), events));
+            }
+            Err(_) => {
+                bad_files.push((*name).to_owned());
+            }
+        }
+    }
+
+    if bad_files.is_empty() && !existing.is_empty() {
+        checks.push(pass(
+            "L2-008",
+            "all sysmon.jsonl files contain valid JSON lines",
+        ));
+    } else if !bad_files.is_empty() {
+        checks.push(warn(
+            "L2-008",
+            format!("invalid JSON in sysmon.jsonl: {}", bad_files.join(", "),),
+        ));
+    }
+
+    host_events
 }
 
 // ── L4-001 ──────────────────────────────────────────────────
@@ -859,6 +1004,100 @@ fn parse_timestamp_us(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_micros())
+}
+
+// ── L4-002 ──────────────────────────────────────────────────
+
+/// Verifies that each GT process record has temporal overlap with at
+/// least one Sysmon event on the same host.
+fn validate_l4_sysmon(
+    records: &[Value],
+    host_events: &[(String, Vec<Value>)],
+    checks: &mut Vec<Check>,
+) {
+    let process_records: Vec<(usize, &Value)> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.get("session_type").and_then(Value::as_str) == Some("process"))
+        .collect();
+
+    if process_records.is_empty() {
+        return;
+    }
+
+    if host_events.is_empty() {
+        checks.push(fail(
+            "L4-002",
+            "process GT records exist but no Sysmon events available",
+        ));
+        return;
+    }
+
+    let mut unmatched = Vec::new();
+    for &(i, record) in &process_records {
+        let host = record.get("host").and_then(Value::as_str);
+        let start_us = record
+            .get("start")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_us);
+        let end_us = record
+            .get("end")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_us);
+
+        let has_overlap = match (host, start_us, end_us) {
+            (Some(host), Some(start_us), Some(end_us)) => {
+                let end_us = end_us + 1_000_000;
+                host_events
+                    .iter()
+                    .filter(|(h, _)| h == host)
+                    .flat_map(|(_, events)| events)
+                    .any(|e| {
+                        e.get("TimeCreated")
+                            .and_then(Value::as_str)
+                            .and_then(parse_sysmon_timestamp_us)
+                            .is_some_and(|t| t >= start_us && t <= end_us)
+                    })
+            }
+            _ => false,
+        };
+
+        if !has_overlap {
+            unmatched.push(i + 1);
+        }
+    }
+
+    if unmatched.is_empty() {
+        checks.push(pass(
+            "L4-002",
+            format!(
+                "all {} GT process record(s) overlap with Sysmon events",
+                process_records.len(),
+            ),
+        ));
+    } else {
+        checks.push(fail(
+            "L4-002",
+            format!(
+                "{}/{} GT process record(s) have no Sysmon overlap: records {unmatched:?}",
+                unmatched.len(),
+                process_records.len(),
+            ),
+        ));
+    }
+}
+
+/// Parses a Sysmon timestamp in either ISO 8601 or `PowerShell`
+/// `/Date(milliseconds)/` format into microseconds since epoch.
+fn parse_sysmon_timestamp_us(s: &str) -> Option<i64> {
+    if let Some(us) = parse_timestamp_us(s) {
+        return Some(us);
+    }
+    let inner = s
+        .strip_prefix("/Date(")
+        .and_then(|rest| rest.strip_suffix(")/"))?;
+    let ms: i64 = inner.parse().ok()?;
+    Some(ms * 1000)
 }
 
 fn parse_protocol(s: &str) -> Option<Protocol> {
@@ -1013,6 +1252,17 @@ mod tests {
         );
     }
 
+    fn assert_warn(report: &Report, id: &str) {
+        let check =
+            find_check(report, id).unwrap_or_else(|| panic!("check {id} not found in report"));
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "expected {id} to warn: {}",
+            check.message,
+        );
+    }
+
     // ── valid bundle ────────────────────────────────────────
 
     #[test]
@@ -1028,8 +1278,8 @@ mod tests {
         );
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
-            "L2-005", "L3-001", "L3-002", "L3-003", "L3-005", "L3-006", "L3-007", "L3-008",
-            "L3-009", "L3-010", "L4-001",
+            "L2-005", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005", "L3-006", "L3-007",
+            "L3-008", "L3-009", "L3-010", "L4-001",
         ] {
             assert_pass(&report, id);
         }
@@ -1594,8 +1844,8 @@ mod tests {
         );
         for id in [
             "L1-001", "L1-002", "L1-003", "L1-004", "L2-001", "L2-002", "L2-003", "L2-004",
-            "L2-005", "L3-001", "L3-002", "L3-003", "L3-005", "L3-006", "L3-007", "L3-008",
-            "L3-009", "L3-010", "L4-001",
+            "L2-005", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005", "L3-006", "L3-007",
+            "L3-008", "L3-009", "L3-010", "L4-001",
         ] {
             assert_pass(&report, id);
         }
@@ -1624,18 +1874,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_valid_bundle(dir.path());
 
-        // Add host_telemetry to meta.json.
+        // Add host_telemetry to meta.json with a non-sysmon kind.
+        // Sysmon entries are excluded from L1-005/L2-006 (validated
+        // via L1-006/L2-008 instead).
         let meta_path = dir.path().join("meta.json");
         let mut meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         meta["host_telemetry"] = serde_json::json!([
-            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+            {"host": "target-001", "kind": "zeek", "path": "host/target-001/conn.jsonl"}
         ]);
         fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
-        // Create the sysmon.jsonl file with valid JSON.
-        let sysmon_path = dir.path().join("host/target-001/sysmon.jsonl");
-        fs::write(&sysmon_path, "{\"EventID\":1}\n{\"EventID\":3}\n").unwrap();
+        let telemetry_path = dir.path().join("host/target-001/conn.jsonl");
+        fs::write(&telemetry_path, "{\"uid\":\"abc\"}\n{\"uid\":\"def\"}\n").unwrap();
 
         let report = run(dir.path()).unwrap();
         assert_pass(&report, "L1-005");
@@ -1651,7 +1902,7 @@ mod tests {
         let mut meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         meta["host_telemetry"] = serde_json::json!([
-            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+            {"host": "target-001", "kind": "zeek", "path": "host/target-001/conn.jsonl"}
         ]);
         fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
@@ -1669,13 +1920,13 @@ mod tests {
         let mut meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         meta["host_telemetry"] = serde_json::json!([
-            {"host": "target-001", "kind": "sysmon", "path": "host/target-001/sysmon.jsonl"}
+            {"host": "target-001", "kind": "zeek", "path": "host/target-001/conn.jsonl"}
         ]);
         fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
         // Write invalid JSON.
-        let sysmon_path = dir.path().join("host/target-001/sysmon.jsonl");
-        fs::write(&sysmon_path, "not valid json\n").unwrap();
+        let telemetry_path = dir.path().join("host/target-001/conn.jsonl");
+        fs::write(&telemetry_path, "not valid json\n").unwrap();
 
         let report = run(dir.path()).unwrap();
         assert_pass(&report, "L1-005");
@@ -1814,5 +2065,300 @@ mod tests {
         .unwrap();
         let report = run(dir.path()).unwrap();
         assert_pass(&report, "L3-010");
+    }
+
+    // ── L1-006 + L2-008: Windows Sysmon ────────────────────────
+
+    const PROCESS_RECORD: &str = concat!(
+        r#"{"scope":"session","label":"normal","#,
+        r#""start":"2026-01-15T09:01:00Z","end":"2026-01-15T09:01:30Z","#,
+        r#""source":"attacker-001","target":"win-target-001","#,
+        r#""session_type":"process","host":"win-target-001","pid":1234}"#,
+    );
+
+    fn meta_json_with_windows() -> String {
+        let mut meta: Value = serde_json::from_str(meta_json()).unwrap();
+        let hosts = meta.get_mut("hosts").unwrap().as_array_mut().unwrap();
+        hosts.push(serde_json::json!({
+            "name": "win-target-001",
+            "os": "windows",
+            "role": "target",
+            "ips": ["10.100.0.4"]
+        }));
+        // Match the real generated meta.json shape: sysmon files
+        // appear in host_telemetry.
+        meta["host_telemetry"] = serde_json::json!([{
+            "host": "win-target-001",
+            "kind": "sysmon",
+            "path": "host/win-target-001/sysmon.jsonl"
+        }]);
+        serde_json::to_string_pretty(&meta).unwrap()
+    }
+
+    fn sysmon_event(ts: &str) -> String {
+        format!(r#"{{"Id":1,"TimeCreated":"{ts}","Message":"Process Create"}}"#)
+    }
+
+    fn create_windows_bundle(dir: &Path) {
+        create_valid_bundle(dir);
+        fs::create_dir_all(dir.join("host/win-target-001")).unwrap();
+        fs::write(dir.join("meta.json"), meta_json_with_windows()).unwrap();
+        let sysmon = format!(
+            "{}\n{}\n",
+            sysmon_event("2026-01-15T09:01:15Z"),
+            sysmon_event("2026-01-15T09:01:20Z"),
+        );
+        fs::write(dir.join("host/win-target-001/sysmon.jsonl"), sysmon).unwrap();
+    }
+
+    #[test]
+    fn sysmon_checks_skipped_when_no_windows_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert!(
+            find_check(&report, "L1-006").is_none(),
+            "L1-006 should be absent for Linux-only bundles",
+        );
+        assert!(
+            find_check(&report, "L2-008").is_none(),
+            "L2-008 should be absent for Linux-only bundles",
+        );
+    }
+
+    #[test]
+    fn windows_host_with_sysmon_passes_l1_006() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-006");
+    }
+
+    #[test]
+    fn missing_sysmon_fails_l1_006() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::remove_file(dir.path().join("host/win-target-001/sysmon.jsonl")).unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L1-006");
+    }
+
+    #[test]
+    fn valid_sysmon_json_passes_l2_008() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L2-008");
+    }
+
+    #[test]
+    fn invalid_sysmon_json_warns_l2_008() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("host/win-target-001/sysmon.jsonl"),
+            "not json\n{\"Id\":1}\n",
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-006");
+        assert_warn(&report, "L2-008");
+    }
+
+    #[test]
+    fn exit_code_one_on_sysmon_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("host/win-target-001/sysmon.jsonl"),
+            "bad line\n{\"Id\":1}\n",
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_eq!(report.exit_code(), ExitCode::from(1));
+    }
+
+    #[test]
+    fn bad_sysmon_line_warns_l2_008_not_fails_l2_006() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("host/win-target-001/sysmon.jsonl"),
+            "not json\n{\"Id\":1}\n",
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        // Sysmon validation must go through L2-008 (warn), not L2-006
+        // (fail).  Regression: host_telemetry used to include sysmon
+        // entries, causing both checks to fire.
+        assert_warn(&report, "L2-008");
+        assert!(
+            find_check(&report, "L2-006").is_none(),
+            "L2-006 must not fire for sysmon-only host_telemetry",
+        );
+    }
+
+    // ── L3-004: process session fields ─────────────────────────
+
+    #[test]
+    fn network_only_records_pass_l3_004() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L3-004");
+    }
+
+    #[test]
+    fn process_record_with_host_and_pid_passes_l3_004() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{PROCESS_RECORD}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L3-004");
+    }
+
+    #[test]
+    fn process_record_missing_host_fails_l3_004() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        let bad = concat!(
+            r#"{"scope":"session","label":"normal","#,
+            r#""start":"2026-01-15T09:01:00Z","end":"2026-01-15T09:01:30Z","#,
+            r#""source":"attacker-001","target":"win-target-001","#,
+            r#""session_type":"process","pid":1234}"#,
+        );
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{bad}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L3-004");
+    }
+
+    #[test]
+    fn process_record_missing_pid_fails_l3_004() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        let bad = concat!(
+            r#"{"scope":"session","label":"normal","#,
+            r#""start":"2026-01-15T09:01:00Z","end":"2026-01-15T09:01:30Z","#,
+            r#""source":"attacker-001","target":"win-target-001","#,
+            r#""session_type":"process","host":"win-target-001"}"#,
+        );
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{bad}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L3-004");
+    }
+
+    // ── L4-002: process GT ↔ Sysmon overlap ────────────────────
+
+    #[test]
+    fn l4_002_skipped_when_no_process_records() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert!(
+            find_check(&report, "L4-002").is_none(),
+            "L4-002 should be absent when there are no process GT records",
+        );
+    }
+
+    #[test]
+    fn process_record_overlaps_sysmon_passes_l4_002() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{PROCESS_RECORD}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-002");
+    }
+
+    #[test]
+    fn process_record_no_overlap_fails_l4_002() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        // Process record at 09:05:00–09:05:30, sysmon events at 09:01:15–09:01:20.
+        let late_process = PROCESS_RECORD
+            .replace("09:01:00Z", "09:05:00Z")
+            .replace("09:01:30Z", "09:05:30Z");
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{late_process}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-002");
+    }
+
+    #[test]
+    fn process_record_no_sysmon_data_fails_l4_002() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        // Add a process record but no Windows host / sysmon data.
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{PROCESS_RECORD}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L4-002");
+    }
+
+    #[test]
+    fn powershell_date_format_matches_l4_002() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        // Use PowerShell /Date()/ format. 2026-01-15T09:01:15Z = 1768467675000 ms.
+        let ps_event = r#"{"Id":1,"TimeCreated":"/Date(1768467675000)/","Message":"test"}"#;
+        fs::write(
+            dir.path().join("host/win-target-001/sysmon.jsonl"),
+            format!("{ps_event}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{PROCESS_RECORD}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L4-002");
+    }
+
+    // ── Windows bundle full pass ───────────────────────────────
+
+    #[test]
+    fn windows_bundle_passes_all_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        create_windows_bundle(dir.path());
+        fs::write(
+            dir.path().join("ground_truth/manifest.jsonl"),
+            format!("{NORMAL_RECORD}\n{PROCESS_RECORD}\n"),
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_eq!(
+            report.summary.failed, 0,
+            "expected no failures: {:#?}",
+            report.checks,
+        );
+        for id in [
+            "L1-001", "L1-002", "L1-003", "L1-004", "L1-006", "L2-001", "L2-002", "L2-003",
+            "L2-004", "L2-005", "L2-008", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005",
+            "L3-006", "L3-007", "L3-008", "L3-009", "L3-010", "L4-001", "L4-002",
+        ] {
+            assert_pass(&report, id);
+        }
     }
 }
