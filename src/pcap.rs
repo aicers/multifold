@@ -502,8 +502,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkt1 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
         let pkt2 = tcp_frame([172, 16, 0, 2], [172, 16, 0, 3], 51000, 443);
-        write_pcap(dir.path(), "capture-lan.pcap", &[(1000, 0, pkt1)]);
-        write_pcap(dir.path(), "capture-dmz.pcap", &[(1000, 0, pkt2)]);
+        write_pcap(dir.path(), "lan.pcap", &[(1000, 0, pkt1)]);
+        write_pcap(dir.path(), "dmz.pcap", &[(1000, 0, pkt2)]);
 
         let mut execs = vec![
             make_execution(

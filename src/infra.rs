@@ -243,7 +243,7 @@ impl ProvisionedEnv {
             .iter()
             .zip(&scenario.infrastructure.network.segments)
         {
-            let pcap_file = format!("capture-{}.pcap", seg.name);
+            let pcap_file = format!("{}.pcap", seg.name);
             let capture_name = format!("mf-{prefix}-{}-capture", seg.name);
             let capture_id = create_capture_container(
                 &self.docker,
@@ -769,7 +769,7 @@ mod tests {
         }
 
         // Pcap file should exist on disk.
-        let pcap_path = net_dir.join("capture-lan.pcap");
+        let pcap_path = net_dir.join("lan.pcap");
         assert!(
             pcap_path.exists(),
             "pcap file should exist after stopping collectors",

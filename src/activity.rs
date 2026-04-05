@@ -1259,7 +1259,7 @@ mod tests {
         isolate_subnets(&mut scenario);
 
         // Activity A: slow command at offset 0.
-        scenario.activities.normal[0].command = "sleep 4".to_owned();
+        scenario.activities.normal[0].command = "sleep 10".to_owned();
         scenario.activities.normal[0].start_offset = "0s".to_owned();
 
         // Activity B: fast command at offset 2s.
@@ -1294,23 +1294,25 @@ mod tests {
             .find(|e| e.attack.is_some())
             .expect("attack activity should be present");
 
-        // B should start around 2s after generation start, not ≥4s.
+        // B should start well before the slow activity A finishes (~10s).
+        // We allow up to 8s to accommodate CI Docker overhead on the 2s
+        // offset while still proving B did not wait for A.
         let b_delay = b.start - start;
         assert!(
-            b_delay < chrono::Duration::try_seconds(4).unwrap(),
+            b_delay < chrono::Duration::try_seconds(8).unwrap(),
             "activity B should start before the slow activity A finishes, \
              but it started {b_delay} after generation start",
         );
 
-        // Activity A (sleep 4) should take at least 3s.
+        // Activity A (sleep 10) should take at least 8s.
         let a = results
             .iter()
             .find(|e| e.attack.is_none())
             .expect("normal activity should be present");
         let a_duration = a.end - a.start;
         assert!(
-            a_duration >= chrono::Duration::try_seconds(3).unwrap(),
-            "slow activity should have taken ≥3s, but took {a_duration}",
+            a_duration >= chrono::Duration::try_seconds(8).unwrap(),
+            "slow activity should have taken ≥8s, but took {a_duration}",
         );
 
         // B should have started before A finished (concurrent proof).
