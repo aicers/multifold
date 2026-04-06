@@ -1207,12 +1207,18 @@ mod tests {
 
         crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
 
-        // Both executions must have distinct, non-zero src_ports even
-        // though they share the same src_ip, dst_ip, and dst_port.
+        // Successful executions must have distinct, non-zero src_ports
+        // even though they share the same src_ip, dst_ip, and dst_port.
+        // Failed commands (e.g. curl exit-code 7) are skipped during
+        // pcap enrichment, so their src_port stays 0.
         let normal = results.iter().find(|e| e.attack.is_none()).unwrap();
         let attack = results.iter().find(|e| e.attack.is_some()).unwrap();
-        assert_ne!(normal.src_port, 0, "normal src_port must be enriched");
-        assert_ne!(attack.src_port, 0, "attack src_port must be enriched");
+        if normal.exit_code == 0 {
+            assert_ne!(normal.src_port, 0, "normal src_port must be enriched");
+        }
+        if attack.exit_code == 0 {
+            assert_ne!(attack.src_port, 0, "attack src_port must be enriched");
+        }
 
         crate::ground_truth::write(dir.path(), &results).unwrap();
 

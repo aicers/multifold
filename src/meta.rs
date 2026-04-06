@@ -19,7 +19,7 @@ pub(crate) fn write(
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
     start: DateTime<Utc>,
-    telemetry: &[(String, String)],
+    telemetry: &[(String, String, String)],
 ) -> Result<()> {
     let meta = build(scenario_filename, scenario, host_ips, start, telemetry)?;
     let json = serde_json::to_string_pretty(&meta).context("failed to serialise meta.json")?;
@@ -33,7 +33,7 @@ fn build(
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
     start: DateTime<Utc>,
-    telemetry: &[(String, String)],
+    telemetry: &[(String, String, String)],
 ) -> Result<BundleMeta> {
     let total_duration = scenario::parse_duration(&scenario.duration)?;
     let end = start + total_duration;
@@ -71,9 +71,9 @@ fn build(
 
     let host_telemetry: Vec<MetaTelemetryEntry> = telemetry
         .iter()
-        .map(|(host, path)| MetaTelemetryEntry {
+        .map(|(host, kind, path)| MetaTelemetryEntry {
             host: host.clone(),
-            kind: "sysmon".to_owned(),
+            kind: kind.clone(),
             path: path.clone(),
         })
         .collect();

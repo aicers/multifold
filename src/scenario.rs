@@ -80,6 +80,11 @@ pub(crate) struct Host {
     pub(crate) vm: Option<VmConfig>,
     #[serde(default)]
     pub(crate) setup: Vec<String>,
+    /// Whether to install and collect Falco telemetry (default: false).
+    ///
+    /// Only applies to Linux container hosts.
+    #[serde(default)]
+    pub(crate) falco: bool,
 }
 
 impl Host {
@@ -1768,6 +1773,14 @@ activities:
         assert_eq!(s.environment.encryption, Encryption::Tls);
         assert_eq!(s.infrastructure.hosts.len(), 3);
         assert_eq!(s.infrastructure.network.segments.len(), 2);
+
+        let backend = s
+            .infrastructure
+            .hosts
+            .iter()
+            .find(|h| h.name == "backend-001")
+            .expect("backend-001 must exist");
+        assert!(backend.falco, "backend-001 must have Falco enabled");
     }
 
     #[test]
