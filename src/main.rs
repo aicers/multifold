@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 mod activity;
+mod falco;
 mod ground_truth;
 mod infra;
 mod meta;
@@ -160,15 +161,26 @@ async fn setup_run_and_assemble(
     );
 
     // Collect Sysmon logs from VMs before stopping collectors.
-    let mut telemetry: Vec<(String, String)> = Vec::new();
+    let mut telemetry: Vec<(String, String, String)> = Vec::new();
     for vm_host in &env.vms {
         if vm_host.sysmon {
             let rel_path = sysmon::collect_logs(vm_host, output_dir).await?;
             telemetry.push((
                 vm_host.host_name.clone(),
+                "sysmon".to_owned(),
                 rel_path.to_string_lossy().into_owned(),
             ));
         }
+    }
+
+    // Collect Falco logs from sidecar containers.
+    for (host_name, falco_id) in &env.falco_containers {
+        let rel_path = falco::collect_logs(&env.docker, falco_id, host_name, output_dir).await?;
+        telemetry.push((
+            host_name.clone(),
+            "falco".to_owned(),
+            rel_path.to_string_lossy().into_owned(),
+        ));
     }
 
     // Stop capture containers so pcap files are flushed and complete.
@@ -200,7 +212,7 @@ fn assemble_bundle(
     host_ips: &[(String, Vec<std::net::Ipv4Addr>)],
     start: chrono::DateTime<chrono::Utc>,
     executions: &mut [activity::Execution],
-    telemetry: &[(String, String)],
+    telemetry: &[(String, String, String)],
 ) -> Result<()> {
     let net_dir = output_dir.join("net");
     pcap::enrich_src_ports(&net_dir, executions)?;

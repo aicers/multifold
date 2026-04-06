@@ -18,6 +18,7 @@ use crate::scenario::Scenario;
 use crate::vm;
 
 const CAPTURE_IMAGE: &str = "alpine:3.19";
+const FALCO_IMAGE: &str = "falcosecurity/falco-no-driver:0.39.2";
 const LINUX_IFNAMSIZ: usize = 15;
 
 /// Holds provisioned Docker resources, VMs, and assigned host IPs.
@@ -31,6 +32,8 @@ pub(crate) struct ProvisionedEnv {
     capture_container_ids: Vec<String>,
     pub(crate) host_ips: Vec<(String, Vec<Ipv4Addr>)>,
     pub(crate) host_containers: Vec<(String, String)>,
+    /// Falco sidecar containers: `(host_name, sidecar_container_id)`.
+    pub(crate) falco_containers: Vec<(String, String)>,
     /// Provisioned libvirt VMs (Windows hosts).
     pub(crate) vms: Vec<vm::ProvisionedVm>,
 }
@@ -119,6 +122,7 @@ impl ProvisionedEnv {
             capture_container_ids: Vec::new(),
             host_ips: Vec::new(),
             host_containers: Vec::new(),
+            falco_containers: Vec::new(),
             vms: Vec::new(),
         };
 
@@ -231,6 +235,31 @@ impl ProvisionedEnv {
                     self.host_ips.push((host_name.clone(), vec![*ip]));
                 }
             }
+        }
+
+        // Phase 2.5: Create privileged Falco sidecar containers for
+        // hosts with system-call monitoring enabled.  Each sidecar uses
+        // the official Falco image and shares the PID namespace of its
+        // target container so that the eBPF probes observe the target's
+        // processes.
+        for host in &scenario.infrastructure.hosts {
+            if !host.falco || host.is_vm() {
+                continue;
+            }
+            let Some(target_id) = created.get(&host.name) else {
+                continue;
+            };
+            if pulled.insert(FALCO_IMAGE.to_owned()) {
+                pull_image(&self.docker, FALCO_IMAGE).await?;
+            }
+            let sidecar_name = format!("mf-{prefix}-{}-falco", host.name);
+            let sidecar_id = create_falco_sidecar(&self.docker, &sidecar_name, target_id).await?;
+            self.docker
+                .start_container::<String>(&sidecar_id, None)
+                .await
+                .with_context(|| format!("failed to start Falco sidecar for '{}'", host.name))?;
+            self.container_ids.push(sidecar_id.clone());
+            self.falco_containers.push((host.name.clone(), sidecar_id));
         }
 
         // Phase 3: Start per-segment capture containers.
@@ -472,6 +501,48 @@ async fn create_capture_container(
         .create_container(Some(opts), config)
         .await
         .with_context(|| format!("failed to create capture container '{name}'"))?;
+    Ok(response.id)
+}
+
+/// Creates a privileged Falco sidecar container that shares the PID
+/// namespace of the target container and monitors system calls via
+/// `engine.kind=modern_ebpf`, writing JSONL events to a file.
+async fn create_falco_sidecar(
+    docker: &Docker,
+    name: &str,
+    target_container_id: &str,
+) -> Result<String> {
+    let output_path = crate::falco::CONTAINER_OUTPUT_PATH;
+    let config = Config {
+        image: Some(FALCO_IMAGE.to_owned()),
+        cmd: Some(vec![
+            "/usr/bin/falco".to_owned(),
+            "-o".to_owned(),
+            "engine.kind=modern_ebpf".to_owned(),
+            "-o".to_owned(),
+            "json_output=true".to_owned(),
+            "-o".to_owned(),
+            "file_output.enabled=true".to_owned(),
+            "-o".to_owned(),
+            format!("file_output.filename={output_path}"),
+            "-o".to_owned(),
+            "stdout_output.enabled=false".to_owned(),
+        ]),
+        host_config: Some(HostConfig {
+            privileged: Some(true),
+            pid_mode: Some(format!("container:{target_container_id}")),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opts = CreateContainerOptions {
+        name: name.to_owned(),
+        ..Default::default()
+    };
+    let response = docker
+        .create_container(Some(opts), config)
+        .await
+        .with_context(|| format!("failed to create Falco sidecar '{name}'"))?;
     Ok(response.id)
 }
 
@@ -774,6 +845,77 @@ mod tests {
             pcap_path.exists(),
             "pcap file should exist after stopping collectors",
         );
+
+        env.down().await.unwrap();
+    }
+
+    /// Verifies the Falco sidecar container starts and stays running
+    /// with the configured flags — requires Docker.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn falco_sidecar_stays_running() {
+        let mut scenario = load_ac0();
+        isolate_subnets(&mut scenario);
+        // Enable Falco on the target host.
+        scenario
+            .infrastructure
+            .hosts
+            .iter_mut()
+            .find(|h| h.name == "target-001")
+            .unwrap()
+            .falco = true;
+
+        let dir = tempfile::tempdir().unwrap();
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).unwrap();
+
+        let env = ProvisionedEnv::up(&scenario, &net_dir).await.unwrap();
+
+        assert_eq!(
+            env.falco_containers.len(),
+            1,
+            "one host has falco: true, so one Falco sidecar",
+        );
+        let (host_name, sidecar_id) = &env.falco_containers[0];
+        assert_eq!(host_name, "target-001");
+
+        // Give the sidecar a moment to either stay up or crash.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let info = env
+            .docker
+            .inspect_container(sidecar_id, None)
+            .await
+            .unwrap();
+        let status = info.state.unwrap().status.unwrap();
+
+        if status != bollard::models::ContainerStateStatusEnum::RUNNING {
+            // In CI environments without eBPF support (e.g. GitHub Actions
+            // runners), Falco exits when it cannot initialise the
+            // modern_ebpf engine.  Verify the exit was caused by a
+            // probe/driver issue, not by invalid configuration flags.
+            use bollard::container::LogsOptions;
+            let opts = LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            };
+            let chunks: Vec<_> = env
+                .docker
+                .logs(sidecar_id, Some(opts))
+                .try_collect()
+                .await
+                .unwrap();
+            let log_output: String = chunks.iter().map(ToString::to_string).collect();
+            let lower = log_output.to_lowercase();
+            assert!(
+                lower.contains("bpf")
+                    || lower.contains("probe")
+                    || lower.contains("driver")
+                    || lower.contains("kernel"),
+                "Falco sidecar exited for unexpected reason (not eBPF):\n{log_output}",
+            );
+        }
 
         env.down().await.unwrap();
     }

@@ -238,6 +238,11 @@ pub(crate) fn run_with_config(bundle: &Path, config: &ValidatorConfig) -> Result
         Vec::new()
     };
 
+    // L1-007 + L2-009: Falco JSONL files
+    if let Some(m) = &meta {
+        validate_falco(bundle, m, &mut checks);
+    }
+
     // L4-002: GT process records ↔ Sysmon temporal overlap
     if !gt_records.is_empty() {
         validate_l4_sysmon(
@@ -787,20 +792,23 @@ fn validate_host_telemetry(bundle: &Path, meta: &Value, checks: &mut Vec<Check>)
         return;
     }
 
-    // Sysmon files are validated separately via L1-006 / L2-008, so
-    // exclude them here to avoid duplicate (and stricter) checks.
-    let non_sysmon: Vec<_> = entries
+    // Sysmon and Falco files are validated separately via their own
+    // L1/L2 checks, so exclude them here to avoid duplicate checks.
+    let generic: Vec<_> = entries
         .iter()
-        .filter(|e| e.get("kind").and_then(Value::as_str) != Some("sysmon"))
+        .filter(|e| {
+            let kind = e.get("kind").and_then(Value::as_str);
+            kind != Some("sysmon") && kind != Some("falco")
+        })
         .collect();
-    if non_sysmon.is_empty() {
+    if generic.is_empty() {
         return;
     }
 
     // L1-005: all referenced telemetry files exist.
     let mut missing = Vec::new();
     let mut existing_paths = Vec::new();
-    for entry in &non_sysmon {
+    for entry in &generic {
         let Some(path_str) = entry.get("path").and_then(Value::as_str) else {
             continue;
         };
@@ -941,6 +949,119 @@ fn validate_sysmon(
     }
 
     host_events
+}
+
+// ── L1-007 + L2-009: Falco JSONL files ───────────────────────
+
+/// Falco records must contain at least these fields to be useful.
+const FALCO_REQUIRED_FIELDS: &[&str] = &["time", "rule", "priority", "output"];
+
+/// Validates that Falco JSONL files declared in `host_telemetry`
+/// exist, contain valid JSON lines, and carry basic required fields.
+fn validate_falco(bundle: &Path, meta: &Value, checks: &mut Vec<Check>) {
+    let Some(entries) = meta.get("host_telemetry").and_then(Value::as_array) else {
+        return;
+    };
+
+    let falco_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.get("kind").and_then(Value::as_str) == Some("falco"))
+        .collect();
+
+    if falco_entries.is_empty() {
+        return;
+    }
+
+    // L1-007: all Falco JSONL files exist.
+    let mut missing = Vec::new();
+    let mut existing_paths = Vec::new();
+    for entry in &falco_entries {
+        let Some(path_str) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if bundle.join(path_str).is_file() {
+            existing_paths.push(path_str);
+        } else {
+            missing.push(path_str);
+        }
+    }
+
+    if missing.is_empty() && !existing_paths.is_empty() {
+        checks.push(pass(
+            "L1-007",
+            format!("all {} Falco JSONL file(s) exist", existing_paths.len()),
+        ));
+    } else if !missing.is_empty() {
+        checks.push(fail(
+            "L1-007",
+            format!("Falco JSONL files not found: {}", missing.join(", ")),
+        ));
+    }
+
+    // L2-009: each Falco JSONL file contains valid JSON lines with
+    // basic required fields.
+    let mut bad_files = Vec::new();
+    let mut empty_files = Vec::new();
+    let mut field_errors = Vec::new();
+    for path_str in &existing_paths {
+        let full_path = bundle.join(path_str);
+        match fs::read_to_string(&full_path) {
+            Ok(content) => {
+                let mut line_count: usize = 0;
+                let mut bad_count: usize = 0;
+                for (i, line) in content.lines().filter(|l| !l.is_empty()).enumerate() {
+                    line_count += 1;
+                    match serde_json::from_str::<Value>(line) {
+                        Ok(record) => {
+                            for field in FALCO_REQUIRED_FIELDS {
+                                if record.get(*field).is_none() {
+                                    field_errors.push(format!(
+                                        "{path_str} line {}: missing '{field}'",
+                                        i + 1,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => bad_count += 1,
+                    }
+                }
+                if line_count == 0 {
+                    empty_files.push(*path_str);
+                } else if bad_count > 0 {
+                    bad_files.push(format!("{path_str} ({bad_count} bad line(s))"));
+                }
+            }
+            Err(_) => {
+                bad_files.push((*path_str).to_owned());
+            }
+        }
+    }
+
+    if bad_files.is_empty()
+        && empty_files.is_empty()
+        && field_errors.is_empty()
+        && !existing_paths.is_empty()
+    {
+        checks.push(pass(
+            "L2-009",
+            "all Falco JSONL files contain valid JSON with required fields",
+        ));
+    } else if !empty_files.is_empty() {
+        checks.push(warn(
+            "L2-009",
+            format!("empty Falco JSONL (no events): {}", empty_files.join(", "),),
+        ));
+    } else if !bad_files.is_empty() {
+        checks.push(warn(
+            "L2-009",
+            format!("invalid JSON in Falco JSONL: {}", bad_files.join(", ")),
+        ));
+    } else if !field_errors.is_empty() {
+        checks.push(warn(
+            "L2-009",
+            format!("Falco records missing fields: {}", field_errors.join("; "),),
+        ));
+    }
 }
 
 // ── L4-001 ──────────────────────────────────────────────────
@@ -2915,5 +3036,148 @@ mod tests {
         // Packets are at exact second boundaries so they land within
         // [start_us, end_us] even with no tolerance.
         assert_pass(&report, "L4-001");
+    }
+
+    // ── L1-007 + L2-009: Falco JSONL ─────────────────────────────
+
+    fn falco_event(rule: &str) -> String {
+        format!(
+            r#"{{"time":"2026-01-15T09:01:00.000000000+0000","rule":"{rule}","priority":"Notice","output":"test event"}}"#,
+        )
+    }
+
+    fn meta_json_with_falco() -> String {
+        let mut meta: Value = serde_json::from_str(meta_json()).unwrap();
+        meta["host_telemetry"] = serde_json::json!([{
+            "host": "target-001",
+            "kind": "falco",
+            "path": "host/target-001/falco.jsonl"
+        }]);
+        serde_json::to_string_pretty(&meta).unwrap()
+    }
+
+    fn create_falco_bundle(dir: &Path) {
+        create_valid_bundle(dir);
+        fs::write(dir.join("meta.json"), meta_json_with_falco()).unwrap();
+        let falco = format!(
+            "{}\n{}\n",
+            falco_event("Terminal shell in container"),
+            falco_event("Write below binary dir"),
+        );
+        fs::write(dir.join("host/target-001/falco.jsonl"), falco).unwrap();
+    }
+
+    #[test]
+    fn falco_checks_skipped_when_no_falco_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        create_valid_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert!(
+            find_check(&report, "L1-007").is_none(),
+            "L1-007 should be absent when no Falco telemetry",
+        );
+        assert!(
+            find_check(&report, "L2-009").is_none(),
+            "L2-009 should be absent when no Falco telemetry",
+        );
+    }
+
+    #[test]
+    fn falco_file_present_passes_l1_007() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-007");
+    }
+
+    #[test]
+    fn missing_falco_file_fails_l1_007() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        fs::remove_file(dir.path().join("host/target-001/falco.jsonl")).unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_fail(&report, "L1-007");
+    }
+
+    #[test]
+    fn valid_falco_json_passes_l2_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L2-009");
+    }
+
+    #[test]
+    fn invalid_falco_json_warns_l2_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        fs::write(
+            dir.path().join("host/target-001/falco.jsonl"),
+            "not json\n{\"time\":\"t\",\"rule\":\"r\",\"priority\":\"p\",\"output\":\"o\"}\n",
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-007");
+        assert_warn(&report, "L2-009");
+    }
+
+    #[test]
+    fn falco_missing_required_field_warns_l2_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        // Record missing the "rule" field.
+        fs::write(
+            dir.path().join("host/target-001/falco.jsonl"),
+            r#"{"time":"2026-01-15T09:01:00Z","priority":"Notice","output":"test"}"#,
+        )
+        .unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-007");
+        assert_warn(&report, "L2-009");
+    }
+
+    #[test]
+    fn empty_falco_file_warns_l2_009() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        fs::write(dir.path().join("host/target-001/falco.jsonl"), "").unwrap();
+        let report = run(dir.path()).unwrap();
+        assert_pass(&report, "L1-007");
+        assert_warn(&report, "L2-009");
+    }
+
+    #[test]
+    fn falco_not_routed_through_generic_telemetry_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        // Falco telemetry must not trigger L1-005 / L2-006 (generic).
+        assert!(
+            find_check(&report, "L1-005").is_none(),
+            "L1-005 must not fire for falco-only host_telemetry",
+        );
+        assert!(
+            find_check(&report, "L2-006").is_none(),
+            "L2-006 must not fire for falco-only host_telemetry",
+        );
+    }
+
+    #[test]
+    fn falco_bundle_passes_all_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        create_falco_bundle(dir.path());
+        let report = run(dir.path()).unwrap();
+        assert_eq!(
+            report.summary.failed, 0,
+            "expected no failures: {:#?}",
+            report.checks,
+        );
+        for id in [
+            "L1-001", "L1-002", "L1-003", "L1-004", "L1-007", "L2-001", "L2-002", "L2-003",
+            "L2-004", "L2-005", "L2-009", "L3-001", "L3-002", "L3-003", "L3-004", "L3-005",
+            "L3-006", "L3-007", "L3-008", "L3-009", "L3-010", "L4-001", "L4-003",
+        ] {
+            assert_pass(&report, id);
+        }
     }
 }

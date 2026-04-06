@@ -26,6 +26,9 @@ const IP_PROTO_ICMP: u8 = 1;
 pub(crate) fn enrich_src_ports(net_dir: &Path, executions: &mut [Execution]) -> Result<()> {
     let mut packets = read_all_packets(net_dir)?;
     for exec in executions.iter_mut() {
+        if exec.exit_code != 0 {
+            continue;
+        }
         let start_us = exec.start.timestamp_micros();
         let end_us = exec.end.timestamp_micros() + 1_000_000;
         let idx = packets
@@ -487,6 +490,24 @@ mod tests {
             1000,
         )];
         assert!(enrich_src_ports(dir.path(), &mut execs).is_err());
+    }
+
+    #[test]
+    fn enrich_skips_failed_executions() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pcap(dir.path(), "capture.pcap", &[]);
+
+        let mut exec = make_execution(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 3),
+            80,
+            Protocol::Tcp,
+            1000,
+        );
+        exec.exit_code = 7;
+        let mut execs = vec![exec];
+        enrich_src_ports(dir.path(), &mut execs).unwrap();
+        assert_eq!(execs[0].src_port, 0);
     }
 
     #[test]
