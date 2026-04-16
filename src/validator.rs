@@ -301,7 +301,7 @@ fn validate_meta(bundle: &Path, checks: &mut Vec<Check>) -> Option<Value> {
     } else {
         checks.push(fail(
             "L2-002",
-            format!("meta.json missing required fields: {}", missing.join(", "),),
+            format!("meta.json missing required fields: {}", missing.join(", ")),
         ));
     }
 
@@ -901,7 +901,7 @@ fn validate_sysmon(
     if missing.is_empty() {
         checks.push(pass(
             "L1-006",
-            format!("all {} Windows host(s) have sysmon.jsonl", existing.len(),),
+            format!("all {} Windows host(s) have sysmon.jsonl", existing.len()),
         ));
     } else {
         checks.push(fail(
@@ -944,7 +944,7 @@ fn validate_sysmon(
     } else if !bad_files.is_empty() {
         checks.push(warn(
             "L2-008",
-            format!("invalid JSON in sysmon.jsonl: {}", bad_files.join(", "),),
+            format!("invalid JSON in sysmon.jsonl: {}", bad_files.join(", ")),
         ));
     }
 
@@ -1049,7 +1049,7 @@ fn validate_falco(bundle: &Path, meta: &Value, checks: &mut Vec<Check>) {
     } else if !empty_files.is_empty() {
         checks.push(warn(
             "L2-009",
-            format!("empty Falco JSONL (no events): {}", empty_files.join(", "),),
+            format!("empty Falco JSONL (no events): {}", empty_files.join(", ")),
         ));
     } else if !bad_files.is_empty() {
         checks.push(warn(
@@ -1059,7 +1059,7 @@ fn validate_falco(bundle: &Path, meta: &Value, checks: &mut Vec<Check>) {
     } else if !field_errors.is_empty() {
         checks.push(warn(
             "L2-009",
-            format!("Falco records missing fields: {}", field_errors.join("; "),),
+            format!("Falco records missing fields: {}", field_errors.join("; ")),
         ));
     }
 }

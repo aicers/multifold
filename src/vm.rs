@@ -8,10 +8,10 @@ use tokio::process::Command;
 use crate::scenario::VmConfig;
 
 /// Maximum time to wait for the VM to obtain a DHCP management IP.
-const DHCP_TIMEOUT: Duration = Duration::from_secs(120);
+const DHCP_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum time to wait for SSH to become reachable.
-const SSH_TIMEOUT: Duration = Duration::from_secs(300);
+const SSH_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Interval between SSH readiness polls.
 const SSH_POLL_INTERVAL: Duration = Duration::from_secs(5);

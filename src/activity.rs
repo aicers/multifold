@@ -456,7 +456,7 @@ mod tests {
     fn lookup_ip_missing_host_errors() {
         let host_ips: Vec<(String, Vec<Ipv4Addr>)> = vec![];
         let err = lookup_ip(&host_ips, "nope").unwrap_err();
-        assert!(err.to_string().contains("no IP found"), "unexpected: {err}",);
+        assert!(err.to_string().contains("no IP found"), "unexpected: {err}");
     }
 
     // ── lookup_container ──────────────────────────────────────────
