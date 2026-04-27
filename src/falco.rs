@@ -131,7 +131,7 @@ async fn exec_output(docker: &Docker, container_id: &str, command: &str) -> Resu
     let exit_code = inspect.exit_code.unwrap_or(0);
     if exit_code != 0 {
         let err_msg = String::from_utf8_lossy(&stderr);
-        bail!("command exited with code {exit_code}: {command}\nstderr: {err_msg}",);
+        bail!("command exited with code {exit_code}: {command}\nstderr: {err_msg}");
     }
 
     Ok(stdout)
