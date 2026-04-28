@@ -5,12 +5,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions, NetworkingConfig, RemoveContainerOptions,
+use bollard::models::{
+    ContainerCreateBody, EndpointIpamConfig, EndpointSettings, HostConfig, Ipam, IpamConfig,
+    NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig,
 };
-use bollard::image::CreateImageOptions;
-use bollard::models::{EndpointIpamConfig, EndpointSettings, HostConfig, Ipam, IpamConfig};
-use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, RemoveContainerOptions,
+};
 use futures_util::TryStreamExt;
 use ipnet::Ipv4Net;
 
@@ -226,7 +227,7 @@ impl ProvisionedEnv {
                     )
                     .await?;
                     self.docker
-                        .start_container::<String>(&id, None)
+                        .start_container(&id, None)
                         .await
                         .with_context(|| format!("failed to start container '{container_name}'"))?;
                     self.container_ids.push(id.clone());
@@ -255,7 +256,7 @@ impl ProvisionedEnv {
             let sidecar_name = format!("mf-{prefix}-{}-falco", host.name);
             let sidecar_id = create_falco_sidecar(&self.docker, &sidecar_name, target_id).await?;
             self.docker
-                .start_container::<String>(&sidecar_id, None)
+                .start_container(&sidecar_id, None)
                 .await
                 .with_context(|| format!("failed to start Falco sidecar for '{}'", host.name))?;
             self.container_ids.push(sidecar_id.clone());
@@ -283,7 +284,7 @@ impl ProvisionedEnv {
             )
             .await?;
             self.docker
-                .start_container::<String>(&capture_id, None)
+                .start_container(&capture_id, None)
                 .await
                 .context("failed to start capture container")?;
             self.container_ids.push(capture_id.clone());
@@ -342,7 +343,7 @@ impl ProvisionedEnv {
         };
         for id in &self.container_ids {
             let _ = self.docker.stop_container(id, None).await;
-            let _ = self.docker.remove_container(id, Some(opts)).await;
+            let _ = self.docker.remove_container(id, Some(opts.clone())).await;
         }
         for id in &self.network_ids {
             let _ = self.docker.remove_network(id).await;
@@ -354,8 +355,8 @@ impl ProvisionedEnv {
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     let (repo, tag) = image.split_once(':').unwrap_or((image, "latest"));
     let opts = CreateImageOptions {
-        from_image: repo,
-        tag,
+        from_image: Some(repo.to_owned()),
+        tag: Some(tag.to_owned()),
         ..Default::default()
     };
     docker
@@ -377,18 +378,18 @@ async fn create_network(
         String::from("com.docker.network.bridge.name"),
         bridge.to_owned(),
     )]);
-    let config = CreateNetworkOptions {
+    let config = NetworkCreateRequest {
         name: name.to_owned(),
-        driver: String::from("bridge"),
-        options,
-        ipam: Ipam {
+        driver: Some(String::from("bridge")),
+        options: Some(options),
+        ipam: Some(Ipam {
             config: Some(vec![IpamConfig {
                 subnet: Some(subnet.to_owned()),
                 gateway: Some(gateway.to_string()),
                 ..Default::default()
             }]),
             ..Default::default()
-        },
+        }),
         ..Default::default()
     };
     let response = docker
@@ -417,16 +418,16 @@ async fn create_host_container(
         },
     );
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some(image.to_owned()),
         cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
-        networking_config: Some(NetworkingConfig::<String> {
-            endpoints_config: endpoints,
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(endpoints),
         }),
         ..Default::default()
     };
     let opts = CreateContainerOptions {
-        name: name.to_owned(),
+        name: Some(name.to_owned()),
         ..Default::default()
     };
     let response = docker
@@ -443,15 +444,15 @@ async fn connect_container(
     container_id: &str,
     ip: Ipv4Addr,
 ) -> Result<()> {
-    let config = ConnectNetworkOptions {
+    let config = NetworkConnectRequest {
         container: container_id.to_owned(),
-        endpoint_config: EndpointSettings {
+        endpoint_config: Some(EndpointSettings {
             ipam_config: Some(EndpointIpamConfig {
                 ipv4_address: Some(ip.to_string()),
                 ..Default::default()
             }),
             ..Default::default()
-        },
+        }),
     };
     docker
         .connect_network(network, config)
@@ -475,7 +476,7 @@ async fn create_capture_container(
         .with_context(|| format!("failed to resolve pcap dir: {}", pcap_dir.display()))?;
     let bind = format!("{}:/capture", pcap_abs.display());
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some(CAPTURE_IMAGE.to_owned()),
         cmd: Some(vec![
             "/bin/sh".to_owned(),
@@ -494,7 +495,7 @@ async fn create_capture_container(
         ..Default::default()
     };
     let opts = CreateContainerOptions {
-        name: name.to_owned(),
+        name: Some(name.to_owned()),
         ..Default::default()
     };
     let response = docker
@@ -513,7 +514,7 @@ async fn create_falco_sidecar(
     target_container_id: &str,
 ) -> Result<String> {
     let output_path = crate::falco::CONTAINER_OUTPUT_PATH;
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some(FALCO_IMAGE.to_owned()),
         cmd: Some(vec![
             "/usr/bin/falco".to_owned(),
@@ -536,7 +537,7 @@ async fn create_falco_sidecar(
         ..Default::default()
     };
     let opts = CreateContainerOptions {
-        name: name.to_owned(),
+        name: Some(name.to_owned()),
         ..Default::default()
     };
     let response = docker
@@ -894,8 +895,8 @@ mod tests {
             // runners), Falco exits when it cannot initialise the
             // modern_ebpf engine.  Verify the exit was caused by a
             // probe/driver issue, not by invalid configuration flags.
-            use bollard::container::LogsOptions;
-            let opts = LogsOptions::<String> {
+            use bollard::query_parameters::LogsOptions;
+            let opts = LogsOptions {
                 stdout: true,
                 stderr: true,
                 ..Default::default()
@@ -947,7 +948,7 @@ mod tests {
         }
         // Verify networks are gone.
         for id in &network_ids {
-            let result = docker.inspect_network::<String>(id, None).await;
+            let result = docker.inspect_network(id, None).await;
             assert!(result.is_err(), "network {id} still exists after teardown");
         }
     }
