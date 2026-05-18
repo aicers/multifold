@@ -296,6 +296,27 @@ fn assemble_bundle(
     }
     println!("Wrote ground_truth/manifest.jsonl");
 
+    // Rewrite per-packet timestamps in every PCAP capture so the bundle
+    // sits on the logical timeline. Runs after enrichment (which still
+    // needs real timestamps) and after GT (which feeds the same
+    // aggregator).
+    for entry in std::fs::read_dir(&net_dir)
+        .with_context(|| format!("failed to read net dir: {}", net_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pcap") {
+            continue;
+        }
+        if let Some(max_ts) = pcap::rewrite_timestamps(&path, time_map, &anchors)?
+            && !identity_run
+            && max_ts > actual_end
+        {
+            actual_end = max_ts;
+        }
+    }
+    println!("Rewrote pcap timestamps");
+
     let scenario_filename = Path::new(scenario_path).file_name().map_or_else(
         || scenario_path.to_owned(),
         |n| n.to_string_lossy().into_owned(),
