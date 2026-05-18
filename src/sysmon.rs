@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
-use crate::falco::{locate_field_string_value, substitute_field_value};
+use crate::falco::{FieldLookup, locate_field, substitute_field_value};
 use crate::time::{ExecAnchor, RewriteDiagnostics, TimeMap, logical_window, rewrite_ts};
 use crate::vm::{self, ProvisionedVm};
 
@@ -189,24 +189,40 @@ fn rewrite_sysmon_line(
         diag.malformed_lines += 1;
         return Ok(None);
     }
-    let Some(time_value) = parsed.get(TIME_KEY) else {
-        diag.missing_field += 1;
-        return Ok(None);
-    };
-    if !time_value.is_string() {
-        // Field is present but not a string (number, bool, null,
-        // object, array). Matches Falco's classification of the same
-        // shape via `time_value.as_str()`.
-        diag.unparseable_ts += 1;
-        return Ok(None);
-    }
-    let Some(raw_value) = locate_field_string_value(body, TIME_KEY) else {
-        // Parsed JSON says the depth-1 string-valued field exists, but
-        // the structural locator could not pin it down. The only
-        // remaining cause under the contract is duplicate top-level
-        // keys (left to a future stricter contract per #72).
-        diag.malformed_lines += 1;
-        return Ok(None);
+    let raw_value = match locate_field(body, TIME_KEY) {
+        FieldLookup::String { start, end } => body
+            .get(start..end)
+            .expect("walker returns an in-bounds range"),
+        FieldLookup::Absent => {
+            // serde may have seen the key under a JSON-escaped spelling
+            // (e.g. `"TimeCreated"`), which the structural walker
+            // does not decode. Stricter handling of escaped key
+            // spellings is left to a future issue; the safe behavior
+            // here is to leave the line byte-identical and count as
+            // malformed.
+            if parsed.get(TIME_KEY).is_some() {
+                diag.malformed_lines += 1;
+            } else {
+                diag.missing_field += 1;
+            }
+            return Ok(None);
+        }
+        FieldLookup::Duplicate => {
+            // Duplicate top-level `TimeCreated`: `serde_json`'s
+            // last-write-wins is not a stable contract to lean on.
+            // Detection happens here, before any type check, so the
+            // classification cannot flip depending on which duplicate
+            // survives the parse.
+            diag.malformed_lines += 1;
+            return Ok(None);
+        }
+        FieldLookup::NonString => {
+            // Field present but not a string (number, bool, null,
+            // object, array). Matches Falco's classification of the
+            // same shape.
+            diag.unparseable_ts += 1;
+            return Ok(None);
+        }
     };
     let Some((real_ts, style)) = parse_sysmon_time(raw_value) else {
         diag.unparseable_ts += 1;
@@ -216,6 +232,8 @@ fn rewrite_sysmon_line(
     let rewritten = rewrite_ts(real_ts, time_map, anchors)?;
     let new_value = format_sysmon_time(rewritten, &style);
     let Some(new_body) = substitute_field_value(body, TIME_KEY, &new_value) else {
+        // The walker said `String` above; if substitution fails here
+        // something has changed under us. Leave the line byte-identical.
         diag.malformed_lines += 1;
         return Ok(None);
     };
@@ -711,6 +729,101 @@ mod tests {
         assert_eq!(diag.unparseable_ts, 1);
         assert_eq!(diag.missing_field, 0);
         assert_eq!(diag.malformed_lines, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_created_keys_count_as_malformed_lines() {
+        // Two depth-1 `TimeCreated` keys, both strings. `serde_json`'s
+        // last-write-wins masks the duplicate at the parsed-value
+        // level, but the structural walker must detect it and the line
+        // must be classified as `malformed_lines` per #72's safe
+        // duplicate-key contract.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15Z","TimeCreated":"2026-01-15T09:02:15Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_created_string_then_non_string_count_as_malformed() {
+        // First `TimeCreated` is a string, second is a number.
+        // `serde_json` last-write-wins surfaces the number, which
+        // without duplicate detection would mis-classify as
+        // `unparseable_ts`. The walker must catch the duplicate first.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15Z","TimeCreated":12345,"Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_created_non_string_then_string_count_as_malformed() {
+        // First `TimeCreated` is a number, second is a string.
+        // `serde_json` last-write-wins surfaces the string; the walker
+        // must still detect the duplicate and classify as
+        // `malformed_lines`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":12345,"TimeCreated":"2026-01-15T09:01:15Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_created_both_non_string_count_as_malformed() {
+        // Both `TimeCreated` values are numbers. Without duplicate
+        // detection before the type check, this would mis-classify as
+        // `unparseable_ts`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":12345,"TimeCreated":67890,"Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn escaped_key_spelling_is_out_of_scope_and_counts_as_malformed() {
+        // `"TimeCreated"` decodes to `TimeCreated` per JSON's
+        // escape rules but the structural walker compares key bytes
+        // literally and does not decode them. The robustness contract
+        // leaves stricter escape-aware key handling to a future issue;
+        // the safe behavior here is to pass the line through
+        // byte-for-byte and count it as `malformed_lines`, never as a
+        // false rewrite of a different key.
+        let dir = tempfile::tempdir().unwrap();
+        // The key on the wire is literally `TimeCreated` (the `T`
+        // byte replaced by `T`). JSON decodes this to
+        // `TimeCreated`, so `serde_json` sees the field; the walker
+        // compares key bytes literally, so it does not.
+        let line = "{\"\\u0054imeCreated\":\"2026-01-15T09:01:15Z\",\"Id\":4688}";
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.missing_field, 0);
         assert!(max_ts.is_none());
         assert_eq!(std::fs::read(&p).unwrap(), original);
     }

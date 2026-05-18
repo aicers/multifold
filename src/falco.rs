@@ -161,15 +161,38 @@ fn rewrite_falco_line(
         diag.malformed_lines += 1;
         return Ok(None);
     }
-    let Some(time_value) = parsed.get(TIME_KEY) else {
-        diag.missing_field += 1;
-        return Ok(None);
+    let raw_value = match locate_field(body, TIME_KEY) {
+        FieldLookup::String { start, end } => body
+            .get(start..end)
+            .expect("walker returns an in-bounds range"),
+        FieldLookup::Absent => {
+            // serde may have seen the key under a JSON-escaped spelling
+            // (e.g. `"time"`), which the structural walker does
+            // not decode. Stricter handling of escaped key spellings is
+            // left to a future issue; the safe behavior here is to
+            // leave the line byte-identical and count as malformed.
+            if parsed.get(TIME_KEY).is_some() {
+                diag.malformed_lines += 1;
+            } else {
+                diag.missing_field += 1;
+            }
+            return Ok(None);
+        }
+        FieldLookup::Duplicate => {
+            // Duplicate top-level `time` keys: `serde_json`'s
+            // last-write-wins is not a stable contract to lean on.
+            // Detection happens here, before any type check, so the
+            // classification cannot flip depending on which duplicate
+            // survives the parse.
+            diag.malformed_lines += 1;
+            return Ok(None);
+        }
+        FieldLookup::NonString => {
+            diag.unparseable_ts += 1;
+            return Ok(None);
+        }
     };
-    let Some(time_str) = time_value.as_str() else {
-        diag.unparseable_ts += 1;
-        return Ok(None);
-    };
-    let Some((real_ts, style, offset)) = parse_falco_time(time_str) else {
+    let Some((real_ts, style, offset)) = parse_falco_time(raw_value) else {
         diag.unparseable_ts += 1;
         return Ok(None);
     };
@@ -177,11 +200,8 @@ fn rewrite_falco_line(
     let rewritten = rewrite_ts(real_ts, time_map, anchors)?;
     let new_value = format_falco_time(rewritten, style, offset);
     let Some(new_body) = substitute_field_value(body, TIME_KEY, &new_value) else {
-        // Field is present per the JSON parse but not locatable by the
-        // depth-1 walker — duplicate top-level keys (last-write-wins is
-        // not a stable contract we lean on). Treat as malformed and
-        // leave the line byte-identical rather than emitting an
-        // incorrect rewrite.
+        // The walker said `String` above; if substitution fails here
+        // something has changed under us. Leave the line byte-identical.
         diag.malformed_lines += 1;
         return Ok(None);
     };
@@ -227,10 +247,46 @@ fn format_falco_time(utc: DateTime<Utc>, style: FalcoStyle, offset: FixedOffset)
     }
 }
 
+/// Classification of a depth-1 object-key lookup. The structural walker
+/// distinguishes these four outcomes so each rewriter can map them to
+/// the right diagnostic counter without relying on `serde_json`'s
+/// last-write-wins behavior for duplicate keys.
+pub(super) enum FieldLookup {
+    /// Field not present as a depth-1 key (as seen by byte-level key
+    /// comparison — JSON-escaped key spellings are intentionally not
+    /// decoded; see `locate_field`).
+    Absent,
+    /// Field appears more than once at depth 1.
+    Duplicate,
+    /// Field present exactly once at depth 1, but its value is not a
+    /// JSON string.
+    NonString,
+    /// Field present exactly once at depth 1 with a string value. The
+    /// range covers the bytes *between* the surrounding quotes —
+    /// neither quote is included.
+    String { start: usize, end: usize },
+}
+
 /// Replaces the string value of the depth-1 object key `field` in a
 /// JSON line with `new_value`, byte-for-byte. Every other byte of the
 /// input — including insignificant whitespace and any unrelated keys —
 /// is preserved exactly.
+///
+/// Internally consults `locate_field`; substitution only happens when
+/// the lookup result is `FieldLookup::String`. Any other outcome
+/// (`Absent`, `Duplicate`, `NonString`) returns `None`.
+pub(super) fn substitute_field_value(raw: &str, field: &str, new_value: &str) -> Option<String> {
+    let FieldLookup::String { start, end } = locate_field(raw, field) else {
+        return None;
+    };
+    let mut out = String::with_capacity(raw.len() + new_value.len());
+    out.push_str(raw.get(..start)?);
+    out.push_str(new_value);
+    out.push_str(raw.get(end..)?);
+    Some(out)
+}
+
+/// Classifies a depth-1 object-key lookup of `field` in `raw`.
 ///
 /// Uses a structural walker (not raw substring search) so:
 ///   - JSON-permitted whitespace around `:` or around the string value
@@ -238,100 +294,86 @@ fn format_falco_time(utc: DateTime<Utc>, style: FalcoStyle, offset: FixedOffset)
 ///   - a `"<field>":"..."` substring embedded inside *another* field's
 ///     string value is not mistaken for the real top-level key,
 ///   - backslash escapes are respected so wire-form `\/Date(...)\/`
-///     survives intact in Sysmon.
+///     survives intact in Sysmon,
+///   - duplicate top-level occurrences of `field` are reported via
+///     `FieldLookup::Duplicate` rather than silently picking one
+///     occurrence the way `serde_json`'s last-write-wins would.
 ///
-/// Returns `None` when the field is not present as a depth-1
-/// string-valued key, or appears more than once at depth 1 (duplicate
-/// keys are treated as ambiguous and left to the caller's
-/// `malformed_lines` counter).
-pub(super) fn substitute_field_value(raw: &str, field: &str, new_value: &str) -> Option<String> {
-    let (val_start, val_end) = locate_field_value_range(raw, field)?;
-    let mut out = String::with_capacity(raw.len() + new_value.len());
-    out.push_str(raw.get(..val_start)?);
-    out.push_str(new_value);
-    out.push_str(raw.get(val_end..)?);
-    Some(out)
-}
-
-/// Returns the raw on-wire bytes (without unescaping) of the depth-1
-/// object key `field`'s string value. Required so Sysmon can recognize
-/// the PowerShell 5.1 `\/Date(<ms>)\/` form verbatim. Returns `None`
-/// under the same conditions as `substitute_field_value`.
-pub(super) fn locate_field_string_value<'a>(raw: &'a str, field: &str) -> Option<&'a str> {
-    let (start, end) = locate_field_value_range(raw, field)?;
-    raw.get(start..end)
-}
-
-/// Locates the byte range covering the string value of the depth-1
-/// object key `field`. The range covers the bytes *between* the
-/// surrounding quotes — neither quote is included. See
-/// `substitute_field_value` for the full robustness contract.
-fn locate_field_value_range(raw: &str, field: &str) -> Option<(usize, usize)> {
+/// Key comparison is byte-exact: JSON-escaped key spellings (e.g.
+/// `"time"` for `time`) are not decoded and therefore do not
+/// match a literal `time` field. A stricter contract that decodes
+/// escape sequences in key strings is left to a future issue.
+pub(super) fn locate_field(raw: &str, field: &str) -> FieldLookup {
     let bytes = raw.as_bytes();
     let field_bytes = field.as_bytes();
     let mut i = skip_ws(bytes, 0);
     if bytes.get(i).copied() != Some(b'{') {
-        return None;
+        return FieldLookup::Absent;
     }
     i += 1;
     i = skip_ws(bytes, i);
     if bytes.get(i).copied() == Some(b'}') {
-        return None;
+        return FieldLookup::Absent;
     }
 
-    let mut result: Option<(usize, usize)> = None;
-    let mut seen_count: usize = 0;
+    let mut result = FieldLookup::Absent;
 
     loop {
         if bytes.get(i).copied() != Some(b'"') {
-            return None;
+            return FieldLookup::Absent;
         }
         let key_start = i + 1;
-        let key_end = scan_string_end(bytes, key_start)?;
+        let Some(key_end) = scan_string_end(bytes, key_start) else {
+            return FieldLookup::Absent;
+        };
         let key_matches = bytes.get(key_start..key_end) == Some(field_bytes);
         i = key_end + 1;
 
         i = skip_ws(bytes, i);
         if bytes.get(i).copied() != Some(b':') {
-            return None;
+            return FieldLookup::Absent;
         }
         i += 1;
         i = skip_ws(bytes, i);
 
-        let value_byte = bytes.get(i).copied()?;
-        if value_byte == b'"' {
+        let Some(value_byte) = bytes.get(i).copied() else {
+            return FieldLookup::Absent;
+        };
+        let (this_match, advance_to): (FieldLookup, usize) = if value_byte == b'"' {
             let val_start = i + 1;
-            let val_end = scan_string_end(bytes, val_start)?;
-            if key_matches {
-                seen_count += 1;
-                if seen_count > 1 {
-                    return None;
-                }
-                result = Some((val_start, val_end));
-            }
-            i = val_end + 1;
+            let Some(val_end) = scan_string_end(bytes, val_start) else {
+                return FieldLookup::Absent;
+            };
+            (
+                FieldLookup::String {
+                    start: val_start,
+                    end: val_end,
+                },
+                val_end + 1,
+            )
         } else {
-            i = skip_value(bytes, i)?;
-            if key_matches {
-                seen_count += 1;
-                if seen_count > 1 {
-                    return None;
-                }
-                // Non-string value: nothing to substitute. `result`
-                // stays `None`; the caller distinguishes the
-                // "field-present-but-non-string" case via the parsed
-                // JSON value's type before invoking us.
+            let Some(end) = skip_value(bytes, i) else {
+                return FieldLookup::Absent;
+            };
+            (FieldLookup::NonString, end)
+        };
+
+        if key_matches {
+            match result {
+                FieldLookup::Absent => result = this_match,
+                _ => return FieldLookup::Duplicate,
             }
         }
 
+        i = advance_to;
         i = skip_ws(bytes, i);
-        match bytes.get(i).copied()? {
-            b',' => {
+        match bytes.get(i).copied() {
+            Some(b',') => {
                 i += 1;
                 i = skip_ws(bytes, i);
             }
-            b'}' => return result,
-            _ => return None,
+            Some(b'}') => return result,
+            _ => return FieldLookup::Absent,
         }
     }
 }
@@ -811,6 +853,100 @@ mod tests {
         assert_eq!(diag.unparseable_ts, 1);
         assert_eq!(diag.missing_field, 0);
         assert_eq!(diag.malformed_lines, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_keys_count_as_malformed_lines() {
+        // Two `time` keys at depth 1, both strings. `serde_json`'s
+        // last-write-wins masks the duplicate at the parsed-value
+        // level, but the structural walker must detect it and the line
+        // must be classified as `malformed_lines` per #72's safe
+        // duplicate-key contract.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time":"2026-01-15T09:01:00Z","time":"2026-01-15T09:02:00Z"}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_keys_string_then_non_string_count_as_malformed() {
+        // First `time` is a string, second is a number. `serde_json`
+        // last-write-wins surfaces the number, which without duplicate
+        // detection would mis-classify as `unparseable_ts`. The walker
+        // must catch the duplicate first.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time":"2026-01-15T09:01:00Z","time":12345}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_keys_non_string_then_string_count_as_malformed() {
+        // First `time` is a number, second is a string. `serde_json`
+        // last-write-wins surfaces the string; the walker must still
+        // detect the duplicate and classify as `malformed_lines`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time":12345,"time":"2026-01-15T09:01:00Z"}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_time_keys_both_non_string_count_as_malformed() {
+        // Both `time` values are numbers. Without duplicate detection
+        // before the type check, this would mis-classify as
+        // `unparseable_ts`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time":12345,"time":67890}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn escaped_key_spelling_is_out_of_scope_and_counts_as_malformed() {
+        // `"time"` decodes to `time` per JSON's escape rules but
+        // the structural walker compares key bytes literally and does
+        // not decode them. The robustness contract leaves stricter
+        // escape-aware key handling to a future issue; the safe
+        // behavior here is to pass the line through byte-for-byte and
+        // count it as `malformed_lines`, never as a false rewrite of
+        // a different key.
+        let dir = tempfile::tempdir().unwrap();
+        // The key on the wire is literally `time` (the bytes
+        // `\`, `u`, `0`, `0`, `7`, `4`, `i`, `m`, `e`). JSON decodes
+        // this to the string `time`, so `serde_json` sees the field;
+        // the walker compares key bytes literally, so it does not.
+        let line = "{\"\\u0074ime\":\"2026-01-15T09:01:00Z\",\"rule\":\"r\"}";
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.missing_field, 0);
         assert!(max_ts.is_none());
         assert_eq!(std::fs::read(&p).unwrap(), original);
     }
