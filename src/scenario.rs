@@ -3,28 +3,70 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use ipnet::Ipv4Net;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const SUPPORTED_VERSION: &str = "1";
 
-/// Parses a human-readable duration string like "5m", "30s", or "2h".
+/// Parses a human-readable duration string like "5m", "30s", "2h", or "14d".
+///
+/// The numeric portion must be bare ASCII digits (no leading `+`/`-`). Leading
+/// and trailing whitespace around the whole string are tolerated, but the
+/// numeric segment itself must be unsigned.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_suffix('s') {
-        let secs: i64 = rest.parse().context("invalid seconds in duration")?;
-        return Duration::try_seconds(secs).context("duration seconds out of range");
+    let trimmed = s.trim();
+    let (digits, unit_secs) = if let Some(rest) = trimmed.strip_suffix('s') {
+        (rest, 1_i64)
+    } else if let Some(rest) = trimmed.strip_suffix('m') {
+        (rest, 60_i64)
+    } else if let Some(rest) = trimmed.strip_suffix('h') {
+        (rest, 3_600_i64)
+    } else if let Some(rest) = trimmed.strip_suffix('d') {
+        (rest, 86_400_i64)
+    } else {
+        bail!("unsupported duration format '{s}': expected suffix s, m, h, or d");
+    };
+
+    ensure!(
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        "invalid duration '{s}': numeric portion must be bare digits (no sign)",
+    );
+
+    let value: i64 = digits
+        .parse()
+        .with_context(|| format!("duration value '{digits}' out of range"))?;
+    let secs = value
+        .checked_mul(unit_secs)
+        .with_context(|| format!("duration '{s}' overflows i64 seconds"))?;
+    Duration::try_seconds(secs).with_context(|| format!("duration '{s}' out of range"))
+}
+
+/// Parses an RFC 3339 timestamp that is explicitly UTC.
+///
+/// Rejects strings without a `Z` or `+00:00` suffix (including bare datetimes
+/// and non-zero offsets) so author intent is preserved — chrono's default
+/// `DateTime<Utc>` deserializer silently normalizes any offset to UTC.
+fn deserialize_utc_datetime<'de, D>(de: D) -> std::result::Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let raw: Option<String> = Option::deserialize(de)?;
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    if !(s.ends_with('Z') || s.ends_with("+00:00")) {
+        return Err(D::Error::custom(format!(
+            "start_at '{s}' must end with 'Z' or '+00:00' (UTC only; \
+             non-UTC offsets and naked datetimes are rejected)",
+        )));
     }
-    if let Some(rest) = s.strip_suffix('m') {
-        let mins: i64 = rest.parse().context("invalid minutes in duration")?;
-        return Duration::try_minutes(mins).context("duration minutes out of range");
-    }
-    if let Some(rest) = s.strip_suffix('h') {
-        let hours: i64 = rest.parse().context("invalid hours in duration")?;
-        return Duration::try_hours(hours).context("duration hours out of range");
-    }
-    bail!("unsupported duration format '{s}': expected suffix s, m, or h")
+    let dt = DateTime::parse_from_rfc3339(&s)
+        .map_err(|e| D::Error::custom(format!("invalid start_at '{s}': {e}")))?
+        .with_timezone(&Utc);
+    Ok(Some(dt))
 }
 
 /// Loads and validates a scenario from a YAML file.
@@ -43,6 +85,20 @@ pub(crate) struct Scenario {
     pub(crate) metadata: Metadata,
     pub(crate) environment: Environment,
     pub(crate) duration: String,
+    /// Optional logical wall-clock anchor for the scenario, RFC 3339 UTC.
+    ///
+    /// When absent, callers substitute `Utc::now()` at run time. Pairing
+    /// `#[serde(default)]` with the custom deserializer is required — without
+    /// it, an absent key errors instead of yielding `None`.
+    // Consumer wiring lands in #63 (`TimeMap` construction). Until then the
+    // field is parsed and validated but not yet read.
+    #[allow(dead_code)]
+    #[serde(default, deserialize_with = "deserialize_utc_datetime")]
+    pub(crate) start_at: Option<DateTime<Utc>>,
+    /// Optional logical duration. When absent, defaults to `duration`
+    /// (i.e., `scale_factor = 1.0`).
+    #[serde(default)]
+    pub(crate) logical_duration: Option<String>,
     pub(crate) infrastructure: Infrastructure,
     pub(crate) activities: Activities,
 }
@@ -286,6 +342,26 @@ fn validate_host_refs(
     Ok(())
 }
 
+/// Validates that an activity's `start_offset` parses and fits inside the
+/// effective logical duration.
+fn validate_start_offset(
+    kind: &str,
+    name: &str,
+    start_offset: &str,
+    logical_duration: Duration,
+) -> Result<()> {
+    let off = parse_duration(start_offset).with_context(|| {
+        format!("invalid start_offset '{start_offset}' for {kind} activity '{name}'")
+    })?;
+    ensure!(
+        off <= logical_duration,
+        "{kind} activity '{name}' start_offset '{start_offset}' exceeds \
+         logical duration ({} s)",
+        logical_duration.num_seconds(),
+    );
+    Ok(())
+}
+
 /// Validates that `campaign_id` and `step` are either both present or both absent.
 fn validate_campaign_fields(a: &AttackActivity) -> Result<()> {
     match (&a.campaign_id, a.step) {
@@ -352,8 +428,31 @@ impl Scenario {
             self.version,
         );
 
-        parse_duration(&self.duration)
+        let duration = parse_duration(&self.duration)
             .with_context(|| format!("invalid duration '{}'", self.duration))?;
+        ensure!(
+            duration > Duration::zero(),
+            "duration '{}' must be strictly positive",
+            self.duration,
+        );
+
+        let effective_logical = if let Some(ld) = &self.logical_duration {
+            let parsed =
+                parse_duration(ld).with_context(|| format!("invalid logical_duration '{ld}'"))?;
+            ensure!(
+                parsed > Duration::zero(),
+                "logical_duration '{ld}' must be strictly positive",
+            );
+            ensure!(
+                parsed >= duration,
+                "logical_duration '{ld}' must be >= duration '{}' \
+                 (time dilation is not supported)",
+                self.duration,
+            );
+            parsed
+        } else {
+            duration
+        };
 
         ensure!(
             !self.infrastructure.hosts.is_empty(),
@@ -451,9 +550,11 @@ impl Scenario {
 
         for a in &self.activities.normal {
             validate_host_refs(&host_names, "normal", &a.name, &a.source, &a.target)?;
+            validate_start_offset("normal", &a.name, &a.start_offset, effective_logical)?;
         }
         for a in &self.activities.attack {
             validate_host_refs(&host_names, "attack", &a.name, &a.source, &a.target)?;
+            validate_start_offset("attack", &a.name, &a.start_offset, effective_logical)?;
             validate_campaign_fields(a)?;
         }
 
@@ -511,7 +612,7 @@ environment:
   workload: light
   threat: single
   attacker: scripted
-duration: 1m
+duration: 5m
 infrastructure:
   hosts:
     - name: h1
@@ -1342,10 +1443,42 @@ activities:
     }
 
     #[test]
+    fn parse_duration_days() {
+        let d = parse_duration("14d").unwrap();
+        assert_eq!(d.num_seconds(), 14 * 86_400);
+    }
+
+    #[test]
+    fn parse_duration_days_and_hours_equivalent() {
+        assert_eq!(
+            parse_duration("14d").unwrap(),
+            parse_duration("336h").unwrap()
+        );
+    }
+
+    #[test]
     fn parse_duration_invalid_suffix() {
-        let err = parse_duration("10d").unwrap_err();
+        let err = parse_duration("10y").unwrap_err();
         assert!(
             err.to_string().contains("unsupported duration format"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_duration_rejects_negative() {
+        let err = parse_duration("-1s").unwrap_err();
+        assert!(
+            err.to_string().contains("bare digits"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_duration_rejects_explicit_plus() {
+        let err = parse_duration("+1s").unwrap_err();
+        assert!(
+            err.to_string().contains("bare digits"),
             "unexpected error: {err}",
         );
     }
@@ -1797,6 +1930,316 @@ activities:
         let inner = &s.infrastructure.network.segments[1];
         assert_eq!(inner.name, "inner");
         assert_eq!(inner.vantage_point, Some(VantagePoint::PostTlsTermination),);
+    }
+
+    // ── start_at / logical_duration parsing ─────────────────────────
+
+    /// Builds a scenario YAML with extra top-level fields injected after
+    /// `duration:`.
+    fn yaml_with_extra(extra: &str) -> String {
+        let base = format!(
+            "\
+version: '1'
+metadata:
+  name: test
+  description: test scenario
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+duration: 1m
+{extra}infrastructure:
+  hosts:
+    - name: h1
+      os: linux
+      role: target
+      image: alpine:3.19
+  network:
+    segments:
+      - name: net
+        subnet: 10.0.0.0/24
+        hosts:
+          - h1
+activities:
+  normal: []
+  attack: []
+"
+        );
+        base
+    }
+
+    #[test]
+    fn start_at_and_logical_duration_absent_by_default() {
+        let s: Scenario = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        s.validate().unwrap();
+        assert!(s.start_at.is_none());
+        assert!(s.logical_duration.is_none());
+    }
+
+    #[test]
+    fn accept_start_at_with_z_suffix_and_logical_duration_days() {
+        let yaml = yaml_with_extra("start_at: \"2026-05-03T00:00:00Z\"\nlogical_duration: 14d\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        s.validate().unwrap();
+        let dt = s.start_at.expect("start_at must be Some");
+        assert_eq!(dt.to_rfc3339(), "2026-05-03T00:00:00+00:00");
+        assert_eq!(s.logical_duration.as_deref(), Some("14d"));
+    }
+
+    #[test]
+    fn accept_start_at_with_explicit_zero_offset() {
+        let yaml =
+            yaml_with_extra("start_at: \"2026-05-03T00:00:00+00:00\"\nlogical_duration: 14d\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        s.validate().unwrap();
+        let dt = s.start_at.expect("start_at must be Some");
+        assert_eq!(dt.to_rfc3339(), "2026-05-03T00:00:00+00:00");
+    }
+
+    #[test]
+    fn reject_start_at_malformed() {
+        let yaml = yaml_with_extra("start_at: \"not-a-date\"\n");
+        let err = serde_yaml::from_str::<Scenario>(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("start_at"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_start_at_non_utc_offset() {
+        let yaml = yaml_with_extra("start_at: \"2026-05-03T09:00:00+09:00\"\n");
+        let err = serde_yaml::from_str::<Scenario>(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("UTC only"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_start_at_naked_datetime() {
+        let yaml = yaml_with_extra("start_at: \"2026-05-03T00:00:00\"\n");
+        let err = serde_yaml::from_str::<Scenario>(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("UTC only"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_start_at_trailing_whitespace() {
+        let yaml = yaml_with_extra("start_at: \"2026-05-03T00:00:00Z \"\n");
+        let err = serde_yaml::from_str::<Scenario>(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("UTC only"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// Returns the full anyhow error chain as a single string for `contains`
+    /// checks against inner context messages.
+    fn err_chain(err: &anyhow::Error) -> String {
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn reject_negative_duration() {
+        let yaml = MINIMAL_YAML.replace("duration: 1m", "duration: -1s");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_explicit_plus_duration() {
+        let yaml = MINIMAL_YAML.replace("duration: 1m", "duration: \"+1s\"");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_zero_duration() {
+        let yaml = MINIMAL_YAML.replace("duration: 1m", "duration: 0s");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("strictly positive"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_zero_logical_duration() {
+        let yaml = yaml_with_extra("logical_duration: 0s\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("strictly positive"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_negative_logical_duration() {
+        let yaml = yaml_with_extra("logical_duration: -1s\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_explicit_plus_logical_duration() {
+        let yaml = yaml_with_extra("logical_duration: \"+1s\"\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_logical_duration_less_than_duration() {
+        // duration is 1m (60s); logical_duration 30s is shorter → dilation.
+        let yaml = yaml_with_extra("logical_duration: 30s\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("time dilation"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn accept_logical_duration_equal_to_duration() {
+        let yaml = yaml_with_extra("logical_duration: 1m\n");
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn reject_negative_start_offset() {
+        let yaml = yaml_with_activities(
+            "  normal:
+    - name: bad
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      start_offset: \"-1s\"
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_explicit_plus_start_offset() {
+        let yaml = yaml_with_activities(
+            "  normal:
+    - name: bad
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      start_offset: \"+1s\"
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err_chain(&err).contains("bare digits"),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn reject_start_offset_exceeding_logical_duration() {
+        // yaml_with_activities uses duration: 5m (300s). 301s exceeds it.
+        let yaml = yaml_with_activities(
+            "  normal:
+    - name: bad
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      start_offset: 301s
+",
+        );
+        let s: Scenario = serde_yaml::from_str(&yaml).unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds logical duration"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn start_offset_bound_uses_logical_duration_when_present() {
+        // duration 1m (60s); logical_duration 5m (300s). offset 120s is OK
+        // against the logical bound but would fail against the real duration.
+        let yaml = "\
+version: '1'
+metadata:
+  name: test
+  description: test scenario
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+duration: 1m
+logical_duration: 5m
+infrastructure:
+  hosts:
+    - name: h1
+      os: linux
+      role: target
+      image: alpine:3.19
+    - name: h2
+      os: linux
+      role: attacker
+      image: alpine:3.19
+  network:
+    segments:
+      - name: net
+        subnet: 10.0.0.0/24
+        hosts:
+          - h1
+          - h2
+activities:
+  normal:
+    - name: ok
+      source: h1
+      target: h2
+      command: echo
+      protocol: tcp
+      dst_port: 80
+      start_offset: 120s
+  attack: []
+";
+        let s: Scenario = serde_yaml::from_str(yaml).unwrap();
+        s.validate().unwrap();
     }
 
     #[test]
