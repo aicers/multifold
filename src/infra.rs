@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 use bollard::Docker;
@@ -88,6 +89,12 @@ fn bridge_name(prefix: &str, segment: &str) -> String {
     format!("mf-{:011x}", hasher.finish() & 0xFFF_FFFF_FFFF)
 }
 
+/// Process-global counter mixed into [`generate_run_id`] so that two
+/// concurrent calls within the same test binary always produce
+/// distinct run IDs, even when `SystemTime::now()` returns the same
+/// nanosecond bucket on coarse clocks.
+static RUN_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 /// Generates a short, per-run identifier to avoid Docker name collisions
 /// across concurrent runs of the same scenario.
 fn generate_run_id() -> String {
@@ -98,6 +105,11 @@ fn generate_run_id() -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u128(nanos);
     h.write_u32(std::process::id());
+    // Atomic counter guarantees in-process uniqueness even if two
+    // calls land in the same nanosecond on a coarse clock. Without
+    // this, parallel `#[ignore]` Docker E2E tests occasionally hit a
+    // 409 "network already exists" when their run IDs collide.
+    h.write_u32(RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
     // Intentionally truncate: we only need 32 bits of entropy for
     // a short collision-resistant suffix, not a full 64-bit hash.
     #[allow(clippy::cast_possible_truncation)]
