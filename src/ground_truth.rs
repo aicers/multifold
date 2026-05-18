@@ -2,11 +2,13 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::activity::Execution;
 use crate::scenario::{Phase, Protocol};
+use crate::time::{ExecAnchor, TimeMap};
 
 /// A single ground-truth record in the v1 JSONL format.
 #[derive(Serialize)]
@@ -38,14 +40,30 @@ struct Record {
 }
 
 /// Writes ground-truth records to `ground_truth/manifest.jsonl` inside
-/// the output directory, one JSON object per line sorted by start time.
-pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
+/// the output directory, one JSON object per line in input order.
+///
+/// Per-execution `start`/`end` timestamps are rewritten through the
+/// matching anchor (so each execution's internal duration is preserved
+/// exactly under compression); records with no matching anchor fall
+/// back to the global `TimeMap`. Returns the maximum rewritten
+/// timestamp seen (or `None` when no records are written), feeding the
+/// `meta.json` aggregator.
+pub(crate) fn write(
+    output_dir: &Path,
+    executions: &[Execution],
+    time_map: &TimeMap,
+    anchors: &[ExecAnchor],
+) -> Result<Option<DateTime<Utc>>> {
     let path = output_dir.join("ground_truth").join("manifest.jsonl");
     let file =
         File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
+    let mut max_ts: Option<DateTime<Utc>> = None;
 
     for exec in executions {
+        let (logical_start, logical_end) = rewrite_execution(exec, time_map, anchors)?;
+        observe(&mut max_ts, logical_end);
+
         let (label, category, technique, phase, tool, campaign_id, step) = match &exec.attack {
             None => ("normal", None, None, None, None, None, None),
             Some(detail) => (
@@ -62,8 +80,8 @@ pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
         let record = Record {
             scope: "session",
             label,
-            start: format_ts(exec.start),
-            end: format_ts(exec.end),
+            start: format_ts(logical_start),
+            end: format_ts(logical_end),
             source: exec.source.clone(),
             target: exec.target.clone(),
             session_type: "network",
@@ -88,7 +106,41 @@ pub(crate) fn write(output_dir: &Path, executions: &[Execution]) -> Result<()> {
     writer
         .flush()
         .context("failed to flush ground truth file")?;
-    Ok(())
+    Ok(max_ts)
+}
+
+fn observe(max_ts: &mut Option<DateTime<Utc>>, ts: DateTime<Utc>) {
+    if max_ts.is_none_or(|m| ts > m) {
+        *max_ts = Some(ts);
+    }
+}
+
+/// Rewrites an `Execution`'s `start`/`end` to logical time. Prefers
+/// the matching per-execution anchor (which preserves intra-session
+/// timing exactly); falls back to the global `TimeMap` if no anchor
+/// matches.
+fn rewrite_execution(
+    exec: &Execution,
+    time_map: &TimeMap,
+    anchors: &[ExecAnchor],
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let anchor = anchors
+        .iter()
+        .find(|a| a.real_start == exec.start && a.source == exec.source && a.target == exec.target);
+    match anchor {
+        Some(a) => {
+            let logical_start = a.logical_start;
+            let logical_end = a
+                .logical_start
+                .checked_add_signed(exec.end - a.real_start)
+                .ok_or_else(|| anyhow!("anchor-based rewrite end overflows DateTime range"))?;
+            Ok((logical_start, logical_end))
+        }
+        None => Ok((
+            time_map.to_logical(exec.start)?,
+            time_map.to_logical(exec.end)?,
+        )),
+    }
 }
 
 /// Formats a `DateTime<Utc>` as an ISO 8601 string without sub-second
@@ -101,10 +153,17 @@ fn format_ts(dt: chrono::DateTime<chrono::Utc>) -> String {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
 
     use super::*;
     use crate::activity::AttackDetail;
+    use crate::time::build_anchors;
+
+    fn identity_time_map() -> TimeMap {
+        let t = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let dur = chrono::Duration::try_minutes(5).unwrap();
+        TimeMap::new(t, t, dur, dur).unwrap()
+    }
 
     fn normal_execution() -> Execution {
         Execution {
@@ -149,7 +208,8 @@ mod tests {
     fn write_and_read(executions: &[Execution]) -> String {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("ground_truth")).unwrap();
-        write(dir.path(), executions).unwrap();
+        let tm = identity_time_map();
+        write(dir.path(), executions, &tm, &[]).unwrap();
         std::fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap()
     }
 
@@ -493,5 +553,64 @@ mod tests {
                 "phase {phase:?} should serialize as '{expected}'",
             );
         }
+    }
+
+    // ── compression rewrite ────────────────────────────────────
+
+    /// Under compression, a record's `start` is rewritten to its
+    /// anchor's `logical_start` (shifted onto the logical timeline)
+    /// while the second-precision `end - start` reflects the
+    /// execution's real duration. Asserted at second resolution
+    /// because [`format_ts`] truncates sub-seconds.
+    #[test]
+    fn compression_rewrites_gt_start_and_preserves_intra_session_duration() {
+        let real_start = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = chrono::Utc.with_ymd_and_hms(2026, 5, 3, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        // Execution begins 60 real seconds in, lasts 2 real seconds.
+        let exec_start = real_start + Duration::try_seconds(60).unwrap();
+        let exec_end = exec_start + Duration::try_seconds(2).unwrap();
+        let exec = Execution {
+            start: exec_start,
+            end: exec_end,
+            ..normal_execution()
+        };
+        let (anchors, _) = build_anchors(&[exec], &tm).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ground_truth")).unwrap();
+        let exec_for_write = Execution {
+            start: exec_start,
+            end: exec_end,
+            ..normal_execution()
+        };
+        let max_ts = write(dir.path(), &[exec_for_write], &tm, &anchors)
+            .unwrap()
+            .expect("at least one record");
+        let content =
+            std::fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+
+        // Intra-session duration is preserved exactly: end - start = 2s.
+        let written_start =
+            chrono::DateTime::parse_from_rfc3339(record["start"].as_str().unwrap()).unwrap();
+        let written_end =
+            chrono::DateTime::parse_from_rfc3339(record["end"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            written_end - written_start,
+            Duration::try_seconds(2).unwrap()
+        );
+
+        // The aggregator's max equals the rewritten end timestamp.
+        assert_eq!(
+            max_ts,
+            anchors[0].logical_start + Duration::try_seconds(2).unwrap(),
+        );
     }
 }

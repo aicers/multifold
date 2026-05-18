@@ -9,11 +9,15 @@ use futures_util::StreamExt;
 use tokio::task::JoinSet;
 
 use crate::scenario::{Activities, Host, Phase, Protocol, parse_duration};
+use crate::time::{TimeMap, logical_offset_to_real};
 use crate::vm::{self, ProvisionedVm};
 
 /// Seconds to wait after the last activity so trailing packets reach
 /// the tcpdump capture containers.
-const CAPTURE_DRAIN_SECS: u64 = 1;
+///
+/// Exposed at crate scope so the per-execution anchor builder in
+/// [`crate::time`] uses the same drain padding as the post-run sleep.
+pub(crate) const CAPTURE_DRAIN_SECS: u64 = 1;
 
 /// Result of executing a single activity inside a container.
 pub(crate) struct Execution {
@@ -138,9 +142,12 @@ pub(crate) async fn run(
     host_containers: &[(String, String)],
     host_ips: &[(String, Vec<Ipv4Addr>)],
     activities: &Activities,
-    generation_start: DateTime<Utc>,
+    time_map: &TimeMap,
     vms: &[ProvisionedVm],
 ) -> Result<Vec<Execution>> {
+    let generation_start = time_map.real_generation_start();
+    let logical_us = time_map.logical_us();
+    let real_us = time_map.real_us();
     // Install tools only in Docker-based activity sources.
     let sources = activity_sources(activities);
     let source_containers: Vec<_> = host_containers
@@ -168,7 +175,10 @@ pub(crate) async fn run(
     // Spawn each activity as an independent task.
     let mut tasks = JoinSet::new();
     for (activity, src_ip, dst_ip, command, backend) in prepared {
-        let target_time = generation_start + activity.offset;
+        let real_offset = logical_offset_to_real(activity.offset, logical_us, real_us)?;
+        let target_time = generation_start
+            .checked_add_signed(real_offset)
+            .context("scheduled target time overflows DateTime range")?;
         let source = activity.source.to_owned();
         let target = activity.target.to_owned();
         let protocol = activity.protocol;
@@ -718,6 +728,13 @@ mod tests {
 
     use crate::test_util::{isolate_subnets, load_ac0, load_mixed_distro};
 
+    /// Builds an identity (no-compression) `TimeMap` rooted at `start`
+    /// with a 5-minute scenario duration, matching the AC-0 fixture.
+    fn identity_time_map(start: DateTime<Utc>) -> TimeMap {
+        let dur = chrono::Duration::try_minutes(5).unwrap();
+        TimeMap::new(start, start, dur, dur).unwrap()
+    }
+
     /// Provisions ac-0 containers, runs both activities immediately
     /// (using a past start time to skip offset waits), and verifies
     /// the execution results.
@@ -743,7 +760,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -837,7 +854,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -847,7 +864,11 @@ mod tests {
         env.stop_collectors().await.unwrap();
 
         crate::pcap::enrich_src_ports(&net_dir, &mut results).unwrap();
-        crate::ground_truth::write(dir.path(), &results).unwrap();
+        {
+            let tm = identity_time_map(past_start);
+            let (anchors, _) = crate::time::build_anchors(&results, &tm).unwrap();
+            crate::ground_truth::write(dir.path(), &results, &tm, &anchors).unwrap();
+        }
 
         let seg = &scenario.infrastructure.network.segments[0];
         let (_, expected_ips) = crate::infra::assign_ips(&seg.subnet, &seg.hosts).unwrap();
@@ -932,7 +953,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -992,7 +1013,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -1042,7 +1063,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -1146,7 +1167,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -1194,7 +1215,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            past_start,
+            &identity_time_map(past_start),
             &[],
         )
         .await
@@ -1220,7 +1241,11 @@ mod tests {
             assert_ne!(attack.src_port, 0, "attack src_port must be enriched");
         }
 
-        crate::ground_truth::write(dir.path(), &results).unwrap();
+        {
+            let tm = identity_time_map(past_start);
+            let (anchors, _) = crate::time::build_anchors(&results, &tm).unwrap();
+            crate::ground_truth::write(dir.path(), &results, &tm, &anchors).unwrap();
+        }
 
         let content = std::fs::read_to_string(gt_dir.join("manifest.jsonl")).unwrap();
         let records: Vec<serde_json::Value> = content
@@ -1286,7 +1311,7 @@ mod tests {
             &env.host_containers,
             &env.host_ips,
             &scenario.activities,
-            start,
+            &identity_time_map(start),
             &[],
         )
         .await

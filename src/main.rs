@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
 mod activity;
@@ -16,6 +16,7 @@ mod scenario;
 mod sysmon;
 #[cfg(test)]
 mod test_util;
+mod time;
 mod validator;
 mod vm;
 
@@ -86,7 +87,8 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
         scenario.activities.attack.len(),
     );
 
-    let start = Utc::now();
+    let real_generation_start = Utc::now();
+    let time_map = build_time_map(&scenario, real_generation_start)?;
     let output_dir = Path::new(output);
     create_output_dirs(output_dir, &scenario)?;
 
@@ -101,7 +103,8 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
     );
 
     // Run setup, activities, then assemble the bundle; always tear down.
-    let result = setup_run_and_assemble(&env, &scenario, scenario_path, output_dir, start).await;
+    let result =
+        setup_run_and_assemble(&env, &scenario, scenario_path, output_dir, &time_map).await;
 
     let teardown_result = env.down().await;
     result?;
@@ -111,6 +114,31 @@ async fn generate(scenario_path: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the effective `start_at` and `logical_duration` from the
+/// scenario and builds the run's `TimeMap`. When `start_at` is absent
+/// the logical timeline is anchored to `real_generation_start`; when
+/// `logical_duration` is absent it equals `scenario.duration`
+/// (identity scale).
+fn build_time_map(
+    scenario: &scenario::Scenario,
+    real_generation_start: DateTime<Utc>,
+) -> Result<time::TimeMap> {
+    let scenario_duration = scenario::parse_duration(&scenario.duration)
+        .with_context(|| format!("invalid scenario duration '{}'", scenario.duration))?;
+    let logical_duration = match &scenario.logical_duration {
+        Some(s) => scenario::parse_duration(s)
+            .with_context(|| format!("invalid logical_duration '{s}'"))?,
+        None => scenario_duration,
+    };
+    let start_at = scenario.start_at.unwrap_or(real_generation_start);
+    time::TimeMap::new(
+        start_at,
+        real_generation_start,
+        scenario_duration,
+        logical_duration,
+    )
+}
+
 /// Runs setup commands, executes activities, stops collectors, and
 /// assembles the output bundle.
 async fn setup_run_and_assemble(
@@ -118,7 +146,7 @@ async fn setup_run_and_assemble(
     scenario: &scenario::Scenario,
     scenario_path: &str,
     output_dir: &Path,
-    start: chrono::DateTime<chrono::Utc>,
+    time_map: &time::TimeMap,
 ) -> Result<()> {
     // Install Sysmon on VMs that have it enabled.
     for vm_host in &env.vms {
@@ -141,7 +169,7 @@ async fn setup_run_and_assemble(
         &env.host_containers,
         &env.host_ips,
         &scenario.activities,
-        start,
+        time_map,
         &env.vms,
     )
     .await?;
@@ -194,7 +222,7 @@ async fn setup_run_and_assemble(
         scenario_path,
         scenario,
         &env.host_ips,
-        start,
+        time_map,
         &mut executions,
         &telemetry,
     )
@@ -202,15 +230,17 @@ async fn setup_run_and_assemble(
 
 /// Assembles the dataset bundle from collected artifacts.
 ///
-/// Reads pcap captures to enrich execution records with source ports,
-/// then writes `ground_truth/manifest.jsonl` and `meta.json` into
-/// the output directory.
+/// Reads pcap captures to enrich execution records with source ports
+/// (still matched on *real* timestamps), builds per-execution anchors,
+/// rewrites Ground Truth onto the logical timeline, and finally writes
+/// `meta.json` with the aggregated `actual_end` returned by each
+/// rewrite pass.
 fn assemble_bundle(
     output_dir: &Path,
     scenario_path: &str,
     scenario: &scenario::Scenario,
     host_ips: &[(String, Vec<std::net::Ipv4Addr>)],
-    start: chrono::DateTime<chrono::Utc>,
+    time_map: &time::TimeMap,
     executions: &mut [activity::Execution],
     telemetry: &[(String, String, String)],
 ) -> Result<()> {
@@ -218,7 +248,34 @@ fn assemble_bundle(
     pcap::enrich_src_ports(&net_dir, executions)?;
     println!("Enriched source ports from pcap");
 
-    ground_truth::write(output_dir, executions)?;
+    let (anchors, warnings) = time::build_anchors(executions, time_map)?;
+    for w in &warnings {
+        eprintln!(
+            "warning: executions {}→{} and {}→{} have overlapping real windows; \
+             packets in the overlap go to the latter",
+            w.a_source, w.a_target, w.b_source, w.b_target,
+        );
+    }
+
+    // Seed the aggregator from each anchor's projected logical end
+    // (logical_start + intra-window duration). The GT pass then
+    // observes its own max as the aggregator climbs.
+    let mut actual_end = time_map.start_at();
+    for a in &anchors {
+        let logical_end = a
+            .logical_start
+            .checked_add_signed(a.real_end - a.real_start)
+            .context("anchor projected logical end overflows DateTime range")?;
+        if logical_end > actual_end {
+            actual_end = logical_end;
+        }
+    }
+
+    if let Some(max_ts) = ground_truth::write(output_dir, executions, time_map, &anchors)?
+        && max_ts > actual_end
+    {
+        actual_end = max_ts;
+    }
     println!("Wrote ground_truth/manifest.jsonl");
 
     let scenario_filename = Path::new(scenario_path).file_name().map_or_else(
@@ -230,7 +287,8 @@ fn assemble_bundle(
         &scenario_filename,
         scenario,
         host_ips,
-        start,
+        time_map,
+        actual_end,
         telemetry,
     )?;
     println!("Wrote meta.json");
@@ -320,6 +378,11 @@ mod tests {
         ]
     }
 
+    fn test_time_map(start: DateTime<Utc>, scenario: &scenario::Scenario) -> time::TimeMap {
+        let dur = scenario::parse_duration(&scenario.duration).unwrap();
+        time::TimeMap::new(start, start, dur, dur).unwrap()
+    }
+
     fn make_execution(ts: i64, attack: Option<activity::AttackDetail>) -> activity::Execution {
         let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
         activity::Execution {
@@ -355,12 +418,13 @@ mod tests {
         let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
         let mut executions = vec![make_execution(ts, None)];
 
+        let time_map = test_time_map(start, &scenario);
         assemble_bundle(
             dir.path(),
             "ac-0.scenario.yaml",
             &scenario,
             &host_ips,
-            start,
+            &time_map,
             &mut executions,
             &[],
         )
@@ -409,12 +473,13 @@ mod tests {
             }),
         )];
 
+        let time_map = test_time_map(start, &scenario);
         assemble_bundle(
             dir.path(),
             "ac-0.scenario.yaml",
             &scenario,
             &host_ips,
-            start,
+            &time_map,
             &mut executions,
             &[],
         )
@@ -463,12 +528,13 @@ mod tests {
             ),
         ];
 
+        let time_map = test_time_map(start, &scenario);
         assemble_bundle(
             dir.path(),
             "ac-0.scenario.yaml",
             &scenario,
             &host_ips,
-            start,
+            &time_map,
             &mut executions,
             &[],
         )
@@ -501,6 +567,67 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["hosts"].as_array().unwrap().len(), 2);
+    }
+
+    /// Under compression, enrichment still matches on real timestamps
+    /// while GT and meta land on the logical timeline.
+    #[test]
+    fn assemble_bundle_under_compression_enriches_and_rewrites() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        create_output_dirs(dir.path(), &scenario).unwrap();
+
+        let ts: i64 = 1_737_000_030;
+        write_synthetic_pcap(
+            &dir.path().join("net"),
+            "lan.pcap",
+            &[(u32::try_from(ts).unwrap(), 49152)],
+        );
+
+        let host_ips = ac0_host_ips();
+        let real_start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
+        let logical_start = chrono::DateTime::parse_from_rfc3339("2026-05-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 5 real minutes → 14 logical days.
+        let time_map = time::TimeMap::new(
+            logical_start,
+            real_start,
+            chrono::Duration::try_minutes(5).unwrap(),
+            chrono::Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let mut executions = vec![make_execution(ts, None)];
+
+        assemble_bundle(
+            dir.path(),
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &time_map,
+            &mut executions,
+            &[],
+        )
+        .unwrap();
+
+        // Enrichment matched on real timestamps and ran before rewrite.
+        assert_eq!(executions[0].src_port, 49152);
+
+        // GT start is logical_start (execution begins exactly at the
+        // real_generation_start, so the anchor's logical_start equals
+        // the effective start_at).
+        let gt = fs::read_to_string(dir.path().join("ground_truth/manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(gt.trim()).unwrap();
+        assert_eq!(record["start"], "2026-05-03T00:00:00Z");
+
+        // meta.json reflects the logical timeline.
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["duration"]["actual_start"], "2026-05-03T00:00:00Z");
+        // generated_at is the real wall-clock at run start, not logical.
+        let expected_generated_at = real_start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        assert_eq!(meta["generated_at"], expected_generated_at);
     }
 
     // ── create_output_dirs ───────────────────────────────────────
