@@ -189,7 +189,24 @@ fn rewrite_sysmon_line(
         diag.malformed_lines += 1;
         return Ok(None);
     }
-    let raw_value = match locate_field(body, TIME_KEY) {
+    let (lookup, walker_total) = locate_field(body, TIME_KEY);
+    // Cross-check the structural walker's depth-1 key count against
+    // `serde_json`'s parsed Map size. They diverge precisely when one
+    // or more source keys collide after JSON-escape decoding (e.g. a
+    // literal `TimeCreated` plus an escaped `TimeCreated`);
+    // `serde_json` collapses them via last-write-wins while the
+    // byte-exact walker sees them as distinct keys. In that case the
+    // walker may have matched only the literal spelling, leaving any
+    // escaped duplicate untouched and the rewrite consistent with
+    // undefined-order semantics. The safe behavior is to refuse the
+    // rewrite and classify the line as malformed, matching the
+    // duplicate-key contract from #72.
+    let serde_total = parsed.as_object().expect("object check above").len();
+    if walker_total != serde_total {
+        diag.malformed_lines += 1;
+        return Ok(None);
+    }
+    let raw_value = match lookup {
         FieldLookup::String { start, end } => body
             .get(start..end)
             .expect("walker returns an in-bounds range"),
@@ -800,6 +817,49 @@ mod tests {
         let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
         assert_eq!(diag.malformed_lines, 1);
         assert_eq!(diag.unparseable_ts, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn literal_then_escaped_time_created_key_counts_as_malformed() {
+        // A literal `TimeCreated` followed by an escape-equivalent
+        // `TimeCreated` (which decodes to `TimeCreated`).
+        // `serde_json` merges both into a single `TimeCreated` entry
+        // via last-write-wins; the byte-exact walker sees only the
+        // literal as a match. Without the walker/serde key-count
+        // cross-check, the walker would rewrite the literal occurrence,
+        // leaving the escaped duplicate byte-identical, and the
+        // rewrite would be consistent with undefined-order semantics.
+        // The safe behavior is to refuse the rewrite and classify the
+        // line as `malformed_lines`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = "{\"TimeCreated\":\"2026-01-15T09:01:15Z\",\"\\u0054imeCreated\":\"2026-01-15T09:02:15Z\",\"Id\":4688}";
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn escaped_then_literal_time_created_key_counts_as_malformed() {
+        // Reverse order: the escaped spelling appears first, the
+        // literal `TimeCreated` second. `serde_json` still merges both
+        // into a single `TimeCreated` entry. The walker sees the
+        // literal as a match and would otherwise rewrite it; the
+        // cross-check must catch the collision and refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let line = "{\"\\u0054imeCreated\":\"2026-01-15T09:02:15Z\",\"TimeCreated\":\"2026-01-15T09:01:15Z\",\"Id\":4688}";
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert_eq!(diag.unparseable_ts, 0);
+        assert_eq!(diag.missing_field, 0);
         assert!(max_ts.is_none());
         assert_eq!(std::fs::read(&p).unwrap(), original);
     }
