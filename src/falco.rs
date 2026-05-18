@@ -177,10 +177,11 @@ fn rewrite_falco_line(
     let rewritten = rewrite_ts(real_ts, time_map, anchors)?;
     let new_value = format_falco_time(rewritten, style, offset);
     let Some(new_body) = substitute_field_value(body, TIME_KEY, &new_value) else {
-        // Field is present per the JSON parse but not locatable by
-        // raw substring search — exotic whitespace inside the line.
-        // Treat as malformed and leave the line byte-identical rather
-        // than emitting an incorrect rewrite.
+        // Field is present per the JSON parse but not locatable by the
+        // depth-1 walker — duplicate top-level keys (last-write-wins is
+        // not a stable contract we lean on). Treat as malformed and
+        // leave the line byte-identical rather than emitting an
+        // incorrect rewrite.
         diag.malformed_lines += 1;
         return Ok(None);
     };
@@ -226,36 +227,188 @@ fn format_falco_time(utc: DateTime<Utc>, style: FalcoStyle, offset: FixedOffset)
     }
 }
 
-/// Replaces the string value of `field` in a compact JSON line with
-/// `new_value`, byte-for-byte, leaving every other byte intact.
+/// Replaces the string value of the depth-1 object key `field` in a
+/// JSON line with `new_value`, byte-for-byte. Every other byte of the
+/// input — including insignificant whitespace and any unrelated keys —
+/// is preserved exactly.
 ///
-/// Searches for the literal `"<field>":"`, then scans forward to the
-/// next unescaped `"` (respecting backslash escapes so wire-form
-/// `\/Date(…)\/` survives intact in Sysmon). Returns `None` when the
-/// pattern is not present.
+/// Uses a structural walker (not raw substring search) so:
+///   - JSON-permitted whitespace around `:` or around the string value
+///     (e.g. `"time" : "..."`) does not defeat the locator,
+///   - a `"<field>":"..."` substring embedded inside *another* field's
+///     string value is not mistaken for the real top-level key,
+///   - backslash escapes are respected so wire-form `\/Date(...)\/`
+///     survives intact in Sysmon.
+///
+/// Returns `None` when the field is not present as a depth-1
+/// string-valued key, or appears more than once at depth 1 (duplicate
+/// keys are treated as ambiguous and left to the caller's
+/// `malformed_lines` counter).
 pub(super) fn substitute_field_value(raw: &str, field: &str, new_value: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let key_pos = raw.find(&needle)?;
-    let value_start = key_pos + needle.len();
+    let (val_start, val_end) = locate_field_value_range(raw, field)?;
+    let mut out = String::with_capacity(raw.len() + new_value.len());
+    out.push_str(raw.get(..val_start)?);
+    out.push_str(new_value);
+    out.push_str(raw.get(val_end..)?);
+    Some(out)
+}
 
+/// Returns the raw on-wire bytes (without unescaping) of the depth-1
+/// object key `field`'s string value. Required so Sysmon can recognize
+/// the PowerShell 5.1 `\/Date(<ms>)\/` form verbatim. Returns `None`
+/// under the same conditions as `substitute_field_value`.
+pub(super) fn locate_field_string_value<'a>(raw: &'a str, field: &str) -> Option<&'a str> {
+    let (start, end) = locate_field_value_range(raw, field)?;
+    raw.get(start..end)
+}
+
+/// Locates the byte range covering the string value of the depth-1
+/// object key `field`. The range covers the bytes *between* the
+/// surrounding quotes — neither quote is included. See
+/// `substitute_field_value` for the full robustness contract.
+fn locate_field_value_range(raw: &str, field: &str) -> Option<(usize, usize)> {
     let bytes = raw.as_bytes();
-    let mut end = value_start;
-    while end < bytes.len() {
-        match bytes.get(end)? {
-            b'\\' if end + 1 < bytes.len() => end += 2,
-            b'"' => break,
-            _ => end += 1,
-        }
+    let field_bytes = field.as_bytes();
+    let mut i = skip_ws(bytes, 0);
+    if bytes.get(i).copied() != Some(b'{') {
+        return None;
     }
-    if end >= bytes.len() {
+    i += 1;
+    i = skip_ws(bytes, i);
+    if bytes.get(i).copied() == Some(b'}') {
         return None;
     }
 
-    let mut out = String::with_capacity(raw.len() + new_value.len());
-    out.push_str(&raw[..value_start]);
-    out.push_str(new_value);
-    out.push_str(&raw[end..]);
-    Some(out)
+    let mut result: Option<(usize, usize)> = None;
+    let mut seen_count: usize = 0;
+
+    loop {
+        if bytes.get(i).copied() != Some(b'"') {
+            return None;
+        }
+        let key_start = i + 1;
+        let key_end = scan_string_end(bytes, key_start)?;
+        let key_matches = bytes.get(key_start..key_end) == Some(field_bytes);
+        i = key_end + 1;
+
+        i = skip_ws(bytes, i);
+        if bytes.get(i).copied() != Some(b':') {
+            return None;
+        }
+        i += 1;
+        i = skip_ws(bytes, i);
+
+        let value_byte = bytes.get(i).copied()?;
+        if value_byte == b'"' {
+            let val_start = i + 1;
+            let val_end = scan_string_end(bytes, val_start)?;
+            if key_matches {
+                seen_count += 1;
+                if seen_count > 1 {
+                    return None;
+                }
+                result = Some((val_start, val_end));
+            }
+            i = val_end + 1;
+        } else {
+            i = skip_value(bytes, i)?;
+            if key_matches {
+                seen_count += 1;
+                if seen_count > 1 {
+                    return None;
+                }
+                // Non-string value: nothing to substitute. `result`
+                // stays `None`; the caller distinguishes the
+                // "field-present-but-non-string" case via the parsed
+                // JSON value's type before invoking us.
+            }
+        }
+
+        i = skip_ws(bytes, i);
+        match bytes.get(i).copied()? {
+            b',' => {
+                i += 1;
+                i = skip_ws(bytes, i);
+            }
+            b'}' => return result,
+            _ => return None,
+        }
+    }
+}
+
+/// Advances past JSON insignificant whitespace (space, tab, CR, LF).
+/// Non-ASCII whitespace is intentionally not skipped — JSON does not
+/// recognize it as insignificant.
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Scans from `start` to the position of the closing `"` of a JSON
+/// string, respecting backslash escapes. Returns the index of the
+/// closing quote (not past it). Returns `None` on premature end.
+fn scan_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'\\' => {
+                bytes.get(i + 1)?;
+                i += 2;
+            }
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Skips over a JSON value starting at `i`, returning the index of the
+/// byte one past the value. Handles strings, objects, arrays, and
+/// primitive tokens (number / `true` / `false` / `null`). Nested
+/// brace/bracket depth is tracked uniformly: well-formed JSON (which
+/// the caller has already validated via `serde_json::from_str`)
+/// guarantees that the next `}` or `]` at depth 1 closes the outer
+/// container.
+fn skip_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    match bytes.get(i).copied()? {
+        b'"' => Some(scan_string_end(bytes, i + 1)? + 1),
+        b'{' | b'[' => {
+            let mut depth: usize = 1;
+            i += 1;
+            while depth > 0 {
+                match bytes.get(i).copied()? {
+                    b'"' => {
+                        i = scan_string_end(bytes, i + 1)? + 1;
+                    }
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            Some(i)
+        }
+        _ => {
+            while let Some(&c) = bytes.get(i) {
+                match c {
+                    b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n' => break,
+                    _ => i += 1,
+                }
+            }
+            Some(i)
+        }
+    }
 }
 
 /// Checks whether a container is currently running.
@@ -590,6 +743,76 @@ mod tests {
             max_ts.unwrap(),
             Utc.with_ymd_and_hms(2026, 1, 15, 9, 2, 30).unwrap(),
         );
+    }
+
+    // ── #72: robustness contract ──────────────────────────────────
+
+    #[test]
+    fn whitespace_around_colon_and_value_round_trips_byte_for_byte() {
+        // Valid JSON with insignificant whitespace around `:` and the
+        // string value must be rewritten correctly under identity and
+        // pass through byte-for-byte (no whitespace normalization, no
+        // diagnostic counter incremented).
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time" : "2026-01-15T09:01:00Z" , "rule":"r"}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert!(max_ts.is_some());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn embedded_time_substring_is_not_mistaken_for_real_key() {
+        // A prior field's string value literally contains `\"time\":`
+        // (i.e. the bytes `"time":` after JSON-unescaping). The
+        // structural walker must skip over it and only rewrite the
+        // real top-level `time`. The embedded substring must remain
+        // byte-for-byte unchanged.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let line = r#"{"output":"x \"time\":\"fake\" y","time":"2026-01-15T09:01:00Z"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[line]);
+        let (_, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        let s = std::fs::read_to_string(&p).unwrap();
+        // The embedded substring survives literally.
+        assert!(
+            s.contains(r#"\"time\":\"fake\""#),
+            "embedded substring must survive byte-for-byte: {s}",
+        );
+        // The real `time` key was rewritten — its original value is
+        // gone, replaced by the logical-start anchor under compression.
+        assert!(
+            !s.contains("2026-01-15T09:01:00Z"),
+            "real top-level `time` should have been rewritten: {s}",
+        );
+    }
+
+    #[test]
+    fn non_string_time_value_counts_as_unparseable_ts() {
+        // `time` is present but its JSON value is a number, not a
+        // string. The contract classifies this as `unparseable_ts`,
+        // matching Sysmon's identical classification of the same shape.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"time":12345,"rule":"r"}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.unparseable_ts, 1);
+        assert_eq!(diag.missing_field, 0);
+        assert_eq!(diag.malformed_lines, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
     }
 
     #[test]

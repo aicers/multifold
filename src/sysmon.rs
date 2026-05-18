@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
-use crate::falco::substitute_field_value;
+use crate::falco::{locate_field_string_value, substitute_field_value};
 use crate::time::{ExecAnchor, RewriteDiagnostics, TimeMap, logical_window, rewrite_ts};
 use crate::vm::{self, ProvisionedVm};
 
@@ -189,12 +189,23 @@ fn rewrite_sysmon_line(
         diag.malformed_lines += 1;
         return Ok(None);
     }
-    if parsed.get(TIME_KEY).is_none() {
+    let Some(time_value) = parsed.get(TIME_KEY) else {
         diag.missing_field += 1;
         return Ok(None);
+    };
+    if !time_value.is_string() {
+        // Field is present but not a string (number, bool, null,
+        // object, array). Matches Falco's classification of the same
+        // shape via `time_value.as_str()`.
+        diag.unparseable_ts += 1;
+        return Ok(None);
     }
-    let Some(raw_value) = locate_raw_value(body, TIME_KEY) else {
-        diag.missing_field += 1;
+    let Some(raw_value) = locate_field_string_value(body, TIME_KEY) else {
+        // Parsed JSON says the depth-1 string-valued field exists, but
+        // the structural locator could not pin it down. The only
+        // remaining cause under the contract is duplicate top-level
+        // keys (left to a future stricter contract per #72).
+        diag.malformed_lines += 1;
         return Ok(None);
     };
     let Some((real_ts, style)) = parse_sysmon_time(raw_value) else {
@@ -216,28 +227,6 @@ fn rewrite_sysmon_line(
         *max_ts = Some(rewritten);
     }
     Ok(Some(new_body))
-}
-
-/// Reads the raw on-wire bytes between the field's opening and closing
-/// quotes without unescaping. Required so the PowerShell 5.1 form
-/// `\/Date(<ms>)\/` is recognized verbatim.
-fn locate_raw_value<'a>(raw: &'a str, field: &str) -> Option<&'a str> {
-    let needle = format!("\"{field}\":\"");
-    let key_pos = raw.find(&needle)?;
-    let value_start = key_pos + needle.len();
-    let bytes = raw.as_bytes();
-    let mut end = value_start;
-    while end < bytes.len() {
-        match bytes.get(end)? {
-            b'\\' if end + 1 < bytes.len() => end += 2,
-            b'"' => break,
-            _ => end += 1,
-        }
-    }
-    if end >= bytes.len() {
-        return None;
-    }
-    Some(&raw[value_start..end])
 }
 
 enum SysmonStyle {
@@ -649,6 +638,81 @@ mod tests {
             max_ts.unwrap(),
             Utc.with_ymd_and_hms(2026, 1, 15, 9, 2, 30).unwrap(),
         );
+    }
+
+    // ── #72: robustness contract ──────────────────────────────────
+
+    #[test]
+    fn whitespace_around_colon_with_date_ms_round_trips_byte_for_byte() {
+        // Valid JSON with insignificant whitespace around `:`. The
+        // `\/Date(<ms>)\/` escaped-slash form must survive intact and
+        // the line must pass through byte-for-byte under identity with
+        // no diagnostic incremented.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated" : "\/Date(1768467675000)\/" , "Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert!(max_ts.is_some());
+        let written = std::fs::read(&p).unwrap();
+        assert_eq!(written, original);
+        assert!(
+            std::str::from_utf8(&written).unwrap().contains(r"\/Date("),
+            "escaped slashes must survive: {}",
+            std::str::from_utf8(&written).unwrap(),
+        );
+    }
+
+    #[test]
+    fn embedded_time_created_substring_is_not_mistaken_for_real_key() {
+        // A prior field's string value literally contains
+        // `\"TimeCreated\":\"fake\"`. The structural walker must skip
+        // it and rewrite only the real top-level `TimeCreated`. The
+        // embedded substring must remain byte-for-byte unchanged.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let line = r#"{"Message":"x \"TimeCreated\":\"fake\" y","TimeCreated":"2026-01-15T09:01:15Z","Id":4688}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[line]);
+        let (_, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            s.contains(r#"\"TimeCreated\":\"fake\""#),
+            "embedded substring must survive byte-for-byte: {s}",
+        );
+        // The real top-level `TimeCreated` was rewritten — its
+        // original ISO string is gone.
+        assert!(
+            !s.contains("\"TimeCreated\":\"2026-01-15T09:01:15Z\""),
+            "real top-level TimeCreated should have been rewritten: {s}",
+        );
+    }
+
+    #[test]
+    fn non_string_time_value_counts_as_unparseable_ts() {
+        // Per #72: a `TimeCreated` field present but with a non-string
+        // value (here, a number) must be classified as
+        // `unparseable_ts`, not `missing_field`. This matches Falco's
+        // classification of the same shape.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":12345,"Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.unparseable_ts, 1);
+        assert_eq!(diag.missing_field, 0);
+        assert_eq!(diag.malformed_lines, 0);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
     }
 
     #[test]
