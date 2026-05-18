@@ -317,6 +317,15 @@ fn assemble_bundle(
     }
     println!("Rewrote pcap timestamps");
 
+    rewrite_telemetry_jsonl(
+        output_dir,
+        telemetry,
+        time_map,
+        &anchors,
+        identity_run,
+        &mut actual_end,
+    )?;
+
     let scenario_filename = Path::new(scenario_path).file_name().map_or_else(
         || scenario_path.to_owned(),
         |n| n.to_string_lossy().into_owned(),
@@ -332,6 +341,46 @@ fn assemble_bundle(
     )?;
     println!("Wrote meta.json");
 
+    Ok(())
+}
+
+/// Rewrites timestamps in Falco and Sysmon JSONL files onto the
+/// logical timeline. Iterates the telemetry triples already collected
+/// upstream and dispatches to the per-kind rewriter. Aggregates the
+/// max rewritten timestamp into `actual_end` (unless this is an
+/// identity run, in which case the aggregator is pinned to
+/// `start + scenario.duration` upstream and JSONL contributions are
+/// intentionally discarded). Prints one diagnostic summary line per
+/// file when any pass-through counter is non-zero.
+fn rewrite_telemetry_jsonl(
+    output_dir: &Path,
+    telemetry: &[(String, String, String)],
+    time_map: &time::TimeMap,
+    anchors: &[time::ExecAnchor],
+    identity_run: bool,
+    actual_end: &mut DateTime<Utc>,
+) -> Result<()> {
+    for (_host, kind, rel_path) in telemetry {
+        let abs_path = output_dir.join(rel_path);
+        let (max_ts, diag) = match kind.as_str() {
+            "falco" => falco::rewrite_timestamps(&abs_path, time_map, anchors)?,
+            "sysmon" => sysmon::rewrite_timestamps(&abs_path, time_map, anchors)?,
+            _ => continue,
+        };
+        if !diag.is_empty() {
+            eprintln!(
+                "warning: {rel_path}: {} malformed line(s), {} missing field(s), \
+                 {} unparseable timestamp(s); {} record(s) outside logical window",
+                diag.malformed_lines, diag.missing_field, diag.unparseable_ts, diag.out_of_window,
+            );
+        }
+        if !identity_run
+            && let Some(ts) = max_ts
+            && ts > *actual_end
+        {
+            *actual_end = ts;
+        }
+    }
     Ok(())
 }
 
