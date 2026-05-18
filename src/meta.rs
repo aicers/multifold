@@ -7,21 +7,34 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::scenario::{
-    self, Attacker, Encryption, Os, Role, Scale, Scenario, Threat, VantagePoint, Workload,
+    Attacker, Encryption, Os, Role, Scale, Scenario, Threat, VantagePoint, Workload,
 };
+use crate::time::TimeMap;
 
 const SCHEMA_VERSION: &str = "1";
 
 /// Writes `meta.json` into the output directory.
+///
+/// `actual_end` is the maximum rewritten timestamp aggregated by the
+/// caller across every artifact rewrite pass; this function does not
+/// recompute it from the scenario duration.
 pub(crate) fn write(
     output_dir: &Path,
     scenario_filename: &str,
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
-    start: DateTime<Utc>,
+    time_map: &TimeMap,
+    actual_end: DateTime<Utc>,
     telemetry: &[(String, String, String)],
 ) -> Result<()> {
-    let meta = build(scenario_filename, scenario, host_ips, start, telemetry)?;
+    let meta = build(
+        scenario_filename,
+        scenario,
+        host_ips,
+        time_map,
+        actual_end,
+        telemetry,
+    )?;
     let json = serde_json::to_string_pretty(&meta).context("failed to serialise meta.json")?;
     let path = output_dir.join("meta.json");
     fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
@@ -32,11 +45,14 @@ fn build(
     scenario_filename: &str,
     scenario: &Scenario,
     host_ips: &[(String, Vec<Ipv4Addr>)],
-    start: DateTime<Utc>,
+    time_map: &TimeMap,
+    actual_end: DateTime<Utc>,
     telemetry: &[(String, String, String)],
 ) -> Result<BundleMeta> {
-    let total_duration = scenario::parse_duration(&scenario.duration)?;
-    let end = start + total_duration;
+    let total = scenario
+        .logical_duration
+        .clone()
+        .unwrap_or_else(|| scenario.duration.clone());
 
     let hosts: Vec<MetaHost> = host_ips
         .iter()
@@ -82,11 +98,11 @@ fn build(
         schema_version: SCHEMA_VERSION.to_owned(),
         scenario: scenario_filename.to_owned(),
         scenario_version: scenario.version.clone(),
-        generated_at: fmt_time(start),
+        generated_at: fmt_time(time_map.real_generation_start()),
         duration: MetaDuration {
-            total: scenario.duration.clone(),
-            actual_start: fmt_time(start),
-            actual_end: fmt_time(end),
+            total,
+            actual_start: fmt_time(time_map.start_at()),
+            actual_end: fmt_time(actual_end),
         },
         environment: MetaEnvironment {
             scale: scenario.environment.scale,
@@ -190,9 +206,19 @@ struct MetaTelemetryEntry {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Duration;
+
     use super::*;
+    use crate::scenario::parse_duration;
 
     type HostIps = Vec<(String, Vec<Ipv4Addr>)>;
+
+    /// Builds an identity (no-compression) `TimeMap` rooted at the
+    /// given timestamp, sized to the scenario's declared duration.
+    fn identity_time_map(start: DateTime<Utc>, scenario: &Scenario) -> TimeMap {
+        let dur = parse_duration(&scenario.duration).unwrap();
+        TimeMap::new(start, start, dur, dur).unwrap()
+    }
 
     fn ac0_test_inputs() -> (Scenario, HostIps, DateTime<Utc>) {
         let yaml = include_str!("../scenarios/ac-0.scenario.yaml");
@@ -210,10 +236,24 @@ mod tests {
         (scenario, host_ips, start)
     }
 
+    fn ac0_build(scenario: &Scenario, host_ips: &HostIps, start: DateTime<Utc>) -> BundleMeta {
+        let tm = identity_time_map(start, scenario);
+        let actual_end = start + Duration::try_minutes(5).unwrap();
+        build(
+            "ac-0.scenario.yaml",
+            scenario,
+            host_ips,
+            &tm,
+            actual_end,
+            &[],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn build_meta_matches_expected_structure() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac0_build(&scenario, &host_ips, start);
 
         assert_eq!(meta.schema_version, "1");
         assert_eq!(meta.scenario, "ac-0.scenario.yaml");
@@ -237,7 +277,7 @@ mod tests {
     #[test]
     fn build_meta_json_roundtrip() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac0_build(&scenario, &host_ips, start);
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -251,7 +291,7 @@ mod tests {
     #[test]
     fn build_meta_matches_ac0_reference() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac0_build(&scenario, &host_ips, start);
         let actual: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
@@ -265,12 +305,15 @@ mod tests {
     fn write_creates_valid_json_file() {
         let (scenario, host_ips, start) = ac0_test_inputs();
         let dir = tempfile::tempdir().unwrap();
+        let tm = identity_time_map(start, &scenario);
+        let actual_end = start + Duration::try_minutes(5).unwrap();
         write(
             dir.path(),
             "ac-0.scenario.yaml",
             &scenario,
             &host_ips,
-            start,
+            &tm,
+            actual_end,
             &[],
         )
         .unwrap();
@@ -288,8 +331,18 @@ mod tests {
     fn build_meta_rejects_unknown_host() {
         let (scenario, _, start) = ac0_test_inputs();
         let host_ips = vec![("ghost-host".to_owned(), vec![Ipv4Addr::new(10, 100, 0, 99)])];
+        let tm = identity_time_map(start, &scenario);
+        let actual_end = start + Duration::try_minutes(5).unwrap();
 
-        let err = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap_err();
+        let err = build(
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            actual_end,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("not found in scenario"),
             "unexpected error: {err}",
@@ -299,7 +352,7 @@ mod tests {
     #[test]
     fn build_meta_omits_vantage_point_when_absent() {
         let (scenario, host_ips, start) = ac0_test_inputs();
-        let meta = build("ac-0.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac0_build(&scenario, &host_ips, start);
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -329,10 +382,24 @@ mod tests {
         (scenario, host_ips, start)
     }
 
+    fn ac2_build(scenario: &Scenario, host_ips: &HostIps, start: DateTime<Utc>) -> BundleMeta {
+        let tm = identity_time_map(start, scenario);
+        let total = parse_duration(&scenario.duration).unwrap();
+        build(
+            "ac-2-tls.scenario.yaml",
+            scenario,
+            host_ips,
+            &tm,
+            start + total,
+            &[],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn build_meta_includes_vantage_points() {
         let (scenario, host_ips, start) = ac2_tls_test_inputs();
-        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac2_build(&scenario, &host_ips, start);
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -351,7 +418,7 @@ mod tests {
     #[test]
     fn build_meta_tls_has_correct_encryption() {
         let (scenario, host_ips, start) = ac2_tls_test_inputs();
-        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac2_build(&scenario, &host_ips, start);
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -361,7 +428,7 @@ mod tests {
     #[test]
     fn build_meta_tls_segments_have_subnets() {
         let (scenario, host_ips, start) = ac2_tls_test_inputs();
-        let meta = build("ac-2-tls.scenario.yaml", &scenario, &host_ips, start, &[]).unwrap();
+        let meta = ac2_build(&scenario, &host_ips, start);
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -371,5 +438,53 @@ mod tests {
         assert_eq!(segments[0]["subnet"], "10.200.0.0/24");
         assert_eq!(segments[1]["name"], "inner");
         assert_eq!(segments[1]["subnet"], "10.200.1.0/24");
+    }
+
+    #[test]
+    fn build_meta_uses_logical_duration_when_present() {
+        let (mut scenario, host_ips, start) = ac0_test_inputs();
+        scenario.logical_duration = Some("14d".to_owned());
+        let logical_start = DateTime::parse_from_rfc3339("2026-05-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tm = TimeMap::new(
+            logical_start,
+            start,
+            parse_duration(&scenario.duration).unwrap(),
+            parse_duration("14d").unwrap(),
+        )
+        .unwrap();
+        let actual_end = logical_start + Duration::try_days(14).unwrap();
+        let meta = build(
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            actual_end,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(meta.generated_at, "2026-01-15T09:00:00Z");
+        assert_eq!(meta.duration.total, "14d");
+        assert_eq!(meta.duration.actual_start, "2026-05-03T00:00:00Z");
+        assert_eq!(meta.duration.actual_end, "2026-05-17T00:00:00Z");
+    }
+
+    #[test]
+    fn build_meta_empty_actual_end_equals_actual_start() {
+        // When the aggregator never observes a rewritten timestamp,
+        // callers seed it with `actual_start` and pass it back here.
+        let (scenario, host_ips, start) = ac0_test_inputs();
+        let tm = identity_time_map(start, &scenario);
+        let meta = build(
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            tm.start_at(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(meta.duration.actual_end, meta.duration.actual_start);
     }
 }
