@@ -257,21 +257,39 @@ fn assemble_bundle(
         );
     }
 
-    // Seed the aggregator from each anchor's projected logical end
-    // (logical_start + intra-window duration). The GT pass then
-    // observes its own max as the aggregator climbs.
-    let mut actual_end = time_map.start_at();
-    for a in &anchors {
-        let logical_end = a
-            .logical_start
-            .checked_add_signed(a.real_end - a.real_start)
-            .context("anchor projected logical end overflows DateTime range")?;
-        if logical_end > actual_end {
-            actual_end = logical_end;
+    // Identity case (the TimeMap is a 1:1 pass-through, i.e. neither
+    // `start_at` nor `logical_duration` is set): fall back to the
+    // pre-#63 `actual_end = start + scenario.duration` so live runs
+    // without any time rewriting retain their previous meta semantics.
+    // The GT rewrite still runs (it is a no-op under the identity
+    // TimeMap), and overlap/drain handling is unaffected.
+    let identity_run = time_map.is_identity();
+    let mut actual_end = if identity_run {
+        let dur = scenario::parse_duration(&scenario.duration)
+            .with_context(|| format!("invalid scenario duration '{}'", scenario.duration))?;
+        time_map
+            .start_at()
+            .checked_add_signed(dur)
+            .context("identity-case actual_end overflows DateTime range")?
+    } else {
+        // Seed the aggregator from each anchor's projected logical end
+        // (logical_start + intra-window duration). The GT pass then
+        // observes its own max as the aggregator climbs.
+        let mut seed = time_map.start_at();
+        for a in &anchors {
+            let logical_end = a
+                .logical_start
+                .checked_add_signed(a.real_end - a.real_start)
+                .context("anchor projected logical end overflows DateTime range")?;
+            if logical_end > seed {
+                seed = logical_end;
+            }
         }
-    }
+        seed
+    };
 
     if let Some(max_ts) = ground_truth::write(output_dir, executions, time_map, &anchors)?
+        && !identity_run
         && max_ts > actual_end
     {
         actual_end = max_ts;
@@ -567,6 +585,55 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["hosts"].as_array().unwrap().len(), 2);
+    }
+
+    /// Identity-case parity: with neither `start_at` nor
+    /// `logical_duration` set, `meta.duration.actual_end` must equal
+    /// `start + scenario.duration` (the pre-#63 fallback), independent
+    /// of the executions' actual end timestamps.
+    #[test]
+    fn assemble_bundle_identity_uses_legacy_actual_end() {
+        let scenario = load_ac0();
+        let dir = tempfile::tempdir().unwrap();
+        create_output_dirs(dir.path(), &scenario).unwrap();
+
+        let ts: i64 = 1_737_000_030;
+        write_synthetic_pcap(
+            &dir.path().join("net"),
+            "lan.pcap",
+            &[(u32::try_from(ts).unwrap(), 49152)],
+        );
+
+        let host_ips = ac0_host_ips();
+        let start = chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).unwrap();
+        // Single ~1s execution well short of the scenario's declared 5m
+        // duration. If we incorrectly aggregated GT/anchor timestamps,
+        // actual_end would land ~2s past `start`, not at `start + 5m`.
+        let mut executions = vec![make_execution(ts, None)];
+
+        let time_map = test_time_map(start, &scenario);
+        assert!(time_map.is_identity());
+        assemble_bundle(
+            dir.path(),
+            "ac-0.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &time_map,
+            &mut executions,
+            &[],
+        )
+        .unwrap();
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("meta.json")).unwrap())
+                .unwrap();
+        let dur = scenario::parse_duration(&scenario.duration).unwrap();
+        let expected_end = (start + dur).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        assert_eq!(meta["duration"]["actual_end"], expected_end);
+        assert_eq!(
+            meta["duration"]["actual_start"],
+            start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        );
     }
 
     /// Under compression, enrichment still matches on real timestamps

@@ -60,6 +60,14 @@ impl TimeMap {
         self.real_generation_start
     }
 
+    /// Returns `true` when the map is a true pass-through: the logical
+    /// timeline coincides with the real one and scale is 1:1. Used by
+    /// the bundle assembler to preserve pre-#63 `actual_end` semantics
+    /// when neither `start_at` nor `logical_duration` is set.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.start_at == self.real_generation_start && self.logical_us == self.real_us
+    }
+
     pub(crate) fn logical_us(&self) -> i64 {
         self.logical_us
     }
