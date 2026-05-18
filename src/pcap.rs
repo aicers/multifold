@@ -282,10 +282,42 @@ pub(crate) fn rewrite_timestamps(
         );
     }
 
-    std::fs::write(path, &data)
+    write_atomic(path, &data)
         .with_context(|| format!("failed to write pcap: {}", path.display()))?;
 
     Ok(max_ts)
+}
+
+/// Atomically replaces `path` with `data` by writing to a sibling
+/// temp file and renaming over the original.
+///
+/// Captures from the tcpdump sidecar are owned by root (UID 0) and
+/// not writable by the host user, so a direct `fs::write` would fail
+/// with `EACCES`. Renaming only requires write+execute on the parent
+/// directory, which the host user does own, and is atomic so a crash
+/// mid-write cannot leave a half-rewritten PCAP behind.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(".rewrite-tmp");
+    let tmp_path = parent.join(&tmp_name);
+
+    // Best-effort cleanup of a stale tmp from a previous crash.
+    let _ = std::fs::remove_file(&tmp_path);
+
+    if let Err(e) = std::fs::write(&tmp_path, data) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn parse_ethernet_packet(data: &[u8], ts_us: i64) -> Option<Packet> {
