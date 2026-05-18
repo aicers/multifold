@@ -1,8 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
+use crate::falco::substitute_field_value;
+use crate::time::{ExecAnchor, RewriteDiagnostics, TimeMap, logical_window, rewrite_ts};
 use crate::vm::{self, ProvisionedVm};
+
+/// JSON key for the Sysmon event timestamp emitted by
+/// `Get-WinEvent | ConvertTo-Json -Compress`.
+const TIME_KEY: &str = "TimeCreated";
 
 /// Minimal Sysmon configuration (SwiftOnSecurity-inspired baseline).
 ///
@@ -124,8 +131,231 @@ pub(crate) async fn collect_logs(vm_host: &ProvisionedVm, output_dir: &Path) -> 
     Ok(relative)
 }
 
+/// Rewrites the `TimeCreated` field of every record in a Sysmon
+/// JSONL file onto the logical timeline. See `falco::rewrite_timestamps`
+/// for the shared contract; the only Sysmon-specific behavior is the
+/// dual wire format (`\/Date(<ms>)\/` for Windows PowerShell 5.1, ISO
+/// 8601 for PowerShell 7+) and the requirement to preserve the input
+/// offset and fractional precision on round-trip.
+pub(crate) fn rewrite_timestamps(
+    path: &Path,
+    time_map: &TimeMap,
+    anchors: &[ExecAnchor],
+) -> Result<(Option<DateTime<Utc>>, RewriteDiagnostics)> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let (start, end) = logical_window(time_map)?;
+
+    let mut diag = RewriteDiagnostics::default();
+    let mut max_ts: Option<DateTime<Utc>> = None;
+    let mut output = String::with_capacity(content.len());
+
+    for raw_line in content.split_inclusive('\n') {
+        let (body, eol) = raw_line
+            .strip_suffix('\n')
+            .map_or((raw_line, ""), |b| (b, "\n"));
+        if body.is_empty() {
+            output.push_str(raw_line);
+            continue;
+        }
+        let new_body =
+            match rewrite_sysmon_line(body, time_map, anchors, &mut diag, &mut max_ts, start, end)?
+            {
+                Some(s) => s,
+                None => body.to_owned(),
+            };
+        output.push_str(&new_body);
+        output.push_str(eol);
+    }
+
+    std::fs::write(path, &output).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok((max_ts, diag))
+}
+
+fn rewrite_sysmon_line(
+    body: &str,
+    time_map: &TimeMap,
+    anchors: &[ExecAnchor],
+    diag: &mut RewriteDiagnostics,
+    max_ts: &mut Option<DateTime<Utc>>,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        diag.malformed_lines += 1;
+        return Ok(None);
+    };
+    if !parsed.is_object() {
+        diag.malformed_lines += 1;
+        return Ok(None);
+    }
+    if parsed.get(TIME_KEY).is_none() {
+        diag.missing_field += 1;
+        return Ok(None);
+    }
+    let Some(raw_value) = locate_raw_value(body, TIME_KEY) else {
+        diag.missing_field += 1;
+        return Ok(None);
+    };
+    let Some((real_ts, style)) = parse_sysmon_time(raw_value) else {
+        diag.unparseable_ts += 1;
+        return Ok(None);
+    };
+
+    let rewritten = rewrite_ts(real_ts, time_map, anchors)?;
+    let new_value = format_sysmon_time(rewritten, &style);
+    let Some(new_body) = substitute_field_value(body, TIME_KEY, &new_value) else {
+        diag.malformed_lines += 1;
+        return Ok(None);
+    };
+
+    if rewritten < window_start || rewritten > window_end {
+        diag.out_of_window += 1;
+    }
+    if max_ts.is_none_or(|m| rewritten > m) {
+        *max_ts = Some(rewritten);
+    }
+    Ok(Some(new_body))
+}
+
+/// Reads the raw on-wire bytes between the field's opening and closing
+/// quotes without unescaping. Required so the PowerShell 5.1 form
+/// `\/Date(<ms>)\/` is recognized verbatim.
+fn locate_raw_value<'a>(raw: &'a str, field: &str) -> Option<&'a str> {
+    let needle = format!("\"{field}\":\"");
+    let key_pos = raw.find(&needle)?;
+    let value_start = key_pos + needle.len();
+    let bytes = raw.as_bytes();
+    let mut end = value_start;
+    while end < bytes.len() {
+        match bytes.get(end)? {
+            b'\\' if end + 1 < bytes.len() => end += 2,
+            b'"' => break,
+            _ => end += 1,
+        }
+    }
+    if end >= bytes.len() {
+        return None;
+    }
+    Some(&raw[value_start..end])
+}
+
+enum SysmonStyle {
+    /// `/Date(<ms>)/`. `escaped` records whether the on-wire slashes
+    /// were backslash-escaped (`\/Date(<ms>)\/`, the Windows
+    /// PowerShell 5.1 default) or bare (`/Date(<ms>)/`, what some
+    /// serde re-encoders emit). The spelling is preserved on write.
+    DateMs { escaped: bool },
+    /// PowerShell 7+ ISO 8601 with `Z`. `frac_digits` is the number of
+    /// digits after the decimal point in the original input.
+    IsoZ { frac_digits: usize },
+    /// PowerShell 7+ ISO 8601 with a numeric offset (e.g. `+09:00`).
+    IsoOffset {
+        offset: FixedOffset,
+        frac_digits: usize,
+    },
+}
+
+fn parse_sysmon_time(raw_value: &str) -> Option<(DateTime<Utc>, SysmonStyle)> {
+    // `/Date(<ms>)/` with either escaped or bare slashes. The
+    // escaped form is the PowerShell 5.1 wire default; the bare form
+    // is what some serde re-encoders emit after a parse round-trip.
+    // Both must round-trip in their original spelling.
+    for (prefix, suffix, escaped) in [("\\/Date(", ")\\/", true), ("/Date(", ")/", false)] {
+        if let Some(inner) = raw_value
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(suffix))
+        {
+            let ms: i64 = inner.parse().ok()?;
+            let utc = Utc.timestamp_millis_opt(ms).single()?;
+            return Some((utc, SysmonStyle::DateMs { escaped }));
+        }
+    }
+    // ISO 8601. Chrono's RFC 3339 parser accepts both `Z` and `±HH:MM`.
+    let dt = DateTime::parse_from_rfc3339(raw_value).ok()?;
+    let frac_digits = count_frac_digits(raw_value);
+    let style = if raw_value.ends_with('Z') {
+        SysmonStyle::IsoZ { frac_digits }
+    } else {
+        SysmonStyle::IsoOffset {
+            offset: *dt.offset(),
+            frac_digits,
+        }
+    };
+    Some((dt.with_timezone(&Utc), style))
+}
+
+fn count_frac_digits(s: &str) -> usize {
+    let Some(dot_pos) = s.find('.') else {
+        return 0;
+    };
+    s[dot_pos + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count()
+}
+
+fn format_sysmon_time(utc: DateTime<Utc>, style: &SysmonStyle) -> String {
+    match style {
+        SysmonStyle::DateMs { escaped: true } => {
+            format!("\\/Date({})\\/", utc.timestamp_millis())
+        }
+        SysmonStyle::DateMs { escaped: false } => {
+            format!("/Date({})/", utc.timestamp_millis())
+        }
+        SysmonStyle::IsoZ { frac_digits } => format_iso(utc, None, *frac_digits),
+        SysmonStyle::IsoOffset {
+            offset,
+            frac_digits,
+        } => format_iso(utc, Some(*offset), *frac_digits),
+    }
+}
+
+/// Emits an ISO 8601 timestamp with arbitrary fractional precision
+/// (`%.Nf` is only defined for N ∈ {3, 6, 9} in chrono). When `offset`
+/// is `None`, the suffix is `Z`; otherwise the suffix is `±HH:MM`.
+fn format_iso(utc: DateTime<Utc>, offset: Option<FixedOffset>, frac_digits: usize) -> String {
+    let head = match offset {
+        None => utc.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        Some(ofs) => utc
+            .with_timezone(&ofs)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+    };
+    let frac = if frac_digits == 0 {
+        String::new()
+    } else {
+        let nanos = utc.timestamp_subsec_nanos();
+        let nanos_str = format!("{nanos:09}");
+        let truncated = if frac_digits <= 9 {
+            nanos_str[..frac_digits].to_string()
+        } else {
+            // Sub-nanosecond inputs (e.g. .NET's 7 digits is fine, but
+            // we still handle padding for any future precision bump).
+            format!("{}{}", nanos_str, "0".repeat(frac_digits - 9))
+        };
+        format!(".{truncated}")
+    };
+    let tail = match offset {
+        None => "Z".to_string(),
+        Some(ofs) => format_offset(ofs),
+    };
+    format!("{head}{frac}{tail}")
+}
+
+fn format_offset(offset: FixedOffset) -> String {
+    let secs = offset.local_minus_utc();
+    let sign = if secs < 0 { '-' } else { '+' };
+    let abs = secs.unsigned_abs();
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    format!("{sign}{h:02}:{m:02}")
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::Duration;
+
     use super::*;
 
     #[test]
@@ -156,6 +386,297 @@ mod tests {
         assert!(
             !SYSMON_CONFIG_XML.contains('\''),
             "config XML must not contain single quotes (breaks PowerShell embedding)",
+        );
+    }
+
+    // ── rewrite_timestamps ────────────────────────────────────────
+
+    fn identity_map() -> TimeMap {
+        let t = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let dur = Duration::try_minutes(5).unwrap();
+        TimeMap::new(t, t, dur, dur).unwrap()
+    }
+
+    fn write_lines(dir: &Path, lines: &[&str]) -> PathBuf {
+        let p = dir.join("sysmon.jsonl");
+        let mut content = String::new();
+        for l in lines {
+            content.push_str(l);
+            content.push('\n');
+        }
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// `Date(<ms>)` payload for `2026-01-15T09:01:15Z` — `1768467675000`.
+    const DATE_MS_LINE: &str = r#"{"TimeCreated":"\/Date(1768467675000)\/","Id":4688}"#;
+    /// Bare `/Date(<ms>)/` — what some serde re-encoders produce.
+    const DATE_MS_BARE_LINE: &str = r#"{"TimeCreated":"/Date(1768467675000)/","Id":4688}"#;
+    const ISO_Z_LINE: &str = r#"{"TimeCreated":"2026-01-15T09:01:15Z","Id":4688}"#;
+    const ISO_OFFSET_LINE: &str = r#"{"TimeCreated":"2026-01-15T18:01:15+09:00","Id":4688}"#;
+
+    #[test]
+    fn identity_preserves_date_ms_wire_form_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[DATE_MS_LINE]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert!(max_ts.is_some());
+        // Critically, the escaped slashes must survive: read the file
+        // back as raw bytes and assert equality, then also verify the
+        // backslash bytes are present.
+        let written = std::fs::read(&p).unwrap();
+        assert_eq!(written, original);
+        assert!(
+            std::str::from_utf8(&written).unwrap().contains(r"\/Date("),
+            "escaped slashes must survive the round-trip",
+        );
+    }
+
+    #[test]
+    fn identity_preserves_bare_date_ms_byte_for_byte() {
+        // Bare `/Date(<ms>)/` (no escaped slashes) must also round-trip
+        // byte-for-byte and NOT be converted to the escaped spelling.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[DATE_MS_BARE_LINE]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert!(max_ts.is_some());
+        let written = std::fs::read(&p).unwrap();
+        assert_eq!(written, original);
+        let s = std::str::from_utf8(&written).unwrap();
+        assert!(
+            s.contains("/Date(") && !s.contains(r"\/Date("),
+            "bare slashes must NOT be promoted to escaped slashes: {s}",
+        );
+    }
+
+    #[test]
+    fn bare_date_ms_rewrites_under_compression_keeps_bare_slashes() {
+        // Same scenario as `date_ms_rewrites_under_compression` but the
+        // input is the bare-slash spelling. The rewritten line must
+        // keep bare slashes, not switch to the escaped form.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[DATE_MS_BARE_LINE]);
+        let (_, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            s.contains("/Date(") && !s.contains(r"\/Date("),
+            "rewritten value must keep bare slashes: {s}",
+        );
+    }
+
+    #[test]
+    fn identity_preserves_iso_z_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[ISO_Z_LINE]);
+        let original = std::fs::read(&p).unwrap();
+        let (_, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn identity_preserves_iso_offset_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[ISO_OFFSET_LINE]);
+        let original = std::fs::read(&p).unwrap();
+        let (_, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        // The `+09:00` offset must NOT be normalized to `Z`.
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("+09:00"));
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn iso_offset_input_keeps_offset_on_rewrite() {
+        // Under a non-identity map, the rewritten value must still
+        // emit `+09:00`, not `Z`. We use a compression map and check
+        // the suffix.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        // 2026-01-15T18:01:15+09:00 == 2026-01-15T09:01:15Z (75 s past
+        // real_start). Within the 30-min real window.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[ISO_OFFSET_LINE]);
+        let (_, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            s.contains("+09:00") && !s.contains('Z'),
+            "rewritten value must preserve the +09:00 offset: {s}",
+        );
+    }
+
+    #[test]
+    fn iso_with_microsecond_fractional_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15.123456Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (_, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn iso_with_seven_digit_dotnet_fractional_round_trips() {
+        // PowerShell 7+ default `.ToString("o")` form carries 7
+        // fractional digits (100 ns ticks). Identity must preserve
+        // every digit, not truncate to microseconds.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15.1234567Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert_eq!(
+            max_ts.unwrap().timestamp_subsec_nanos(),
+            123_456_700,
+            "identity rewrite must preserve 100 ns ticks",
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn iso_with_nine_digit_nanosecond_fractional_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15.123456789Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(diag.is_empty());
+        assert_eq!(max_ts.unwrap().timestamp_subsec_nanos(), 123_456_789);
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    // ── edge cases ────────────────────────────────────────────────
+
+    #[test]
+    fn missing_field_passes_through_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"Id":4688,"Message":"no timestamp"}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.missing_field, 1);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn malformed_line_passes_through_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"2026-01-15T09:01:15Z""#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.malformed_lines, 1);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn unparseable_timestamp_passes_through_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"TimeCreated":"not a timestamp","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let original = std::fs::read(&p).unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.unparseable_ts, 1);
+        assert!(max_ts.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn out_of_window_keeps_record_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        // 10 logical minutes past the 5-minute window under identity.
+        let line = r#"{"TimeCreated":"2026-01-15T09:10:00Z","Id":4688}"#;
+        let p = write_lines(dir.path(), &[line]);
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(diag.out_of_window, 1);
+        assert!(max_ts.is_some());
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    // ── aggregator contract ───────────────────────────────────────
+
+    #[test]
+    fn empty_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sysmon.jsonl");
+        std::fs::write(&p, "").unwrap();
+        let (max_ts, diag) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert!(max_ts.is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn multi_record_returns_max_rewritten_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(
+            dir.path(),
+            &[
+                r#"{"TimeCreated":"2026-01-15T09:01:00Z"}"#,
+                r#"{"TimeCreated":"2026-01-15T09:02:30Z"}"#,
+                r#"{"TimeCreated":"2026-01-15T09:02:00Z"}"#,
+            ],
+        );
+        let (max_ts, _) = rewrite_timestamps(&p, &identity_map(), &[]).unwrap();
+        assert_eq!(
+            max_ts.unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 15, 9, 2, 30).unwrap(),
+        );
+    }
+
+    #[test]
+    fn date_ms_rewrites_under_compression() {
+        // 30 real minutes → 14 logical days. The record's real ts is
+        // 75 s past `real_start`. Under compression, the rewritten
+        // value must land at `start_at + 75s * scale`.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let tm = TimeMap::new(
+            logical_start,
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[DATE_MS_LINE]);
+        let (max_ts, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        // Wire form must remain `\/Date(<new_ms>)\/`.
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains(r"\/Date("), "DateMs wire form must survive: {s}");
+        // Sanity: max_ts is the rewritten ts of the only record.
+        assert!(max_ts.is_some());
+        assert_ne!(
+            max_ts.unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 15, 9, 1, 15).unwrap()
         );
     }
 }

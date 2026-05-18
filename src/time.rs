@@ -78,6 +78,14 @@ impl TimeMap {
 
     /// Maps a real wall-clock timestamp onto the logical timeline.
     pub(crate) fn to_logical(&self, real: DateTime<Utc>) -> Result<DateTime<Utc>> {
+        // Identity is a true pass-through: returning `real` directly
+        // preserves full sub-microsecond precision (chrono's
+        // `num_microseconds()` would otherwise truncate the nanosecond
+        // tail, breaking byte-identity round-trips for Falco's 9-digit
+        // and PS7's 7-digit fractional inputs).
+        if self.is_identity() {
+            return Ok(real);
+        }
         let delta_us = (real - self.real_generation_start)
             .num_microseconds()
             .context("real-to-generation delta exceeds microsecond range")?;
@@ -192,9 +200,7 @@ pub(crate) fn detect_overlaps(anchors: &[ExecAnchor]) -> Vec<OverlapWarning> {
 // Ground Truth (#63) rewrites by execution identity to guarantee
 // per-record provenance, not by window containment. This helper is
 // the entry point PCAP (#64) and JSONL (#65) rewriters consume —
-// they only have a raw timestamp, no execution identity. Locked-in
-// here per #63's "TimeMap + anchor list" deliverable so the later
-// sub-issues plug in without re-deriving the lookup rule.
+// they only have a raw timestamp, no execution identity.
 pub(crate) fn rewrite_ts(
     real_ts: DateTime<Utc>,
     time_map: &TimeMap,
@@ -210,11 +216,39 @@ pub(crate) fn rewrite_ts(
     }
 }
 
+/// Counters describing pass-through outcomes a JSONL rewrite pass
+/// produced. Returned as data so unit tests stay pure; the call site
+/// renders a per-file summary line via `eprintln!`.
+#[derive(Default)]
+pub(crate) struct RewriteDiagnostics {
+    pub(crate) malformed_lines: u64,
+    pub(crate) missing_field: u64,
+    pub(crate) unparseable_ts: u64,
+    pub(crate) out_of_window: u64,
+}
+
+impl RewriteDiagnostics {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.malformed_lines == 0
+            && self.missing_field == 0
+            && self.unparseable_ts == 0
+            && self.out_of_window == 0
+    }
+}
+
+/// Returns the inclusive `[start_at, start_at + logical_duration]`
+/// window the rewriter uses to flag out-of-window records.
+pub(crate) fn logical_window(time_map: &TimeMap) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let end = time_map
+        .start_at()
+        .checked_add_signed(Duration::microseconds(time_map.logical_us()))
+        .ok_or_else(|| anyhow!("logical window end overflows DateTime range"))?;
+    Ok((time_map.start_at(), end))
+}
+
 /// Returns the anchor whose window contains `ts`. Under overlapping
 /// windows, the deterministic pick is the one with the latest
 /// `real_start` not exceeding `ts`.
-//
-// Kept private; reachable only via `rewrite_ts`.
 fn find_anchor(anchors: &[ExecAnchor], ts: DateTime<Utc>) -> Option<&ExecAnchor> {
     anchors
         .iter()
@@ -291,6 +325,20 @@ mod tests {
         let tm = identity_map(start);
         let ts = fixed(1_737_000_120);
         assert_eq!(tm.to_logical(ts).unwrap(), ts);
+    }
+
+    #[test]
+    fn identity_map_preserves_sub_microsecond_precision() {
+        // Falco's 9-digit nanosecond and PS7's 7-digit 100 ns fractions
+        // would be truncated by `num_microseconds()`. The identity
+        // short-circuit must preserve them so JSONL rewriters can
+        // round-trip byte-for-byte under identity.
+        let start = fixed(1_737_000_000);
+        let tm = identity_map(start);
+        let ts = start + Duration::nanoseconds(123_456_789);
+        let mapped = tm.to_logical(ts).unwrap();
+        assert_eq!(mapped, ts);
+        assert_eq!(mapped.timestamp_subsec_nanos(), 123_456_789);
     }
 
     #[test]
