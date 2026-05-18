@@ -195,7 +195,6 @@ pub(crate) fn detect_overlaps(anchors: &[ExecAnchor]) -> Vec<OverlapWarning> {
 // they only have a raw timestamp, no execution identity. Locked-in
 // here per #63's "TimeMap + anchor list" deliverable so the later
 // sub-issues plug in without re-deriving the lookup rule.
-#[allow(dead_code)]
 pub(crate) fn rewrite_ts(
     real_ts: DateTime<Utc>,
     time_map: &TimeMap,
@@ -215,9 +214,7 @@ pub(crate) fn rewrite_ts(
 /// windows, the deterministic pick is the one with the latest
 /// `real_start` not exceeding `ts`.
 //
-// Kept private; reachable only via `rewrite_ts`. See its allow note
-// for the #63 → #64/#65 hand-off rationale.
-#[allow(dead_code)]
+// Kept private; reachable only via `rewrite_ts`.
 fn find_anchor(anchors: &[ExecAnchor], ts: DateTime<Utc>) -> Option<&ExecAnchor> {
     anchors
         .iter()
