@@ -139,15 +139,17 @@ pub(crate) async fn collect_logs(vm_host: &ProvisionedVm, output_dir: &Path) -> 
 /// offset and fractional precision on round-trip.
 ///
 /// Sysmon JSONL is treated as having a single rewritten timestamp
-/// field, `TimeCreated`. This is the only timestamp-bearing entry
-/// emitted by the `Get-WinEvent | ConvertTo-Json -Compress` capture
-/// path used in `collect_logs`, and matches the field consumed by the
-/// validator's L4-002 process↔Sysmon overlap check in
-/// `src/validator.rs`. If a future Sysmon schema or capture variant
-/// introduces additional timestamp fields that downstream consumers
-/// care about, extend this rewriter and revisit the validator
-/// accordingly. See `falco::rewrite_timestamps` for the analogous
-/// `time`-only scope statement on the Falco side.
+/// field, `TimeCreated`. This is the only Sysmon timestamp field the
+/// validator consumes today (via the L4-002 process↔Sysmon overlap
+/// check in `src/validator.rs`), so it is also the only one rewritten
+/// here. Other timestamp-looking fields observed in the
+/// `Get-WinEvent | ConvertTo-Json -Compress` capture path used by
+/// `collect_logs` — for example `SystemTime` siblings inside the
+/// `System` block and per-event-ID timestamps embedded in `Message` —
+/// are intentionally left untouched because no downstream consumer
+/// depends on them; if that changes, extend this rewriter and revisit
+/// the validator accordingly. See `falco::rewrite_timestamps` for the
+/// analogous `time`-only scope statement on the Falco side.
 pub(crate) fn rewrite_timestamps(
     path: &Path,
     time_map: &TimeMap,
