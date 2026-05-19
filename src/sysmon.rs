@@ -892,7 +892,48 @@ mod tests {
     fn date_ms_rewrites_under_compression() {
         // 30 real minutes → 14 logical days. The record's real ts is
         // 75 s past `real_start`. Under compression, the rewritten
-        // value must land at `start_at + 75s * scale`.
+        // value must land at `logical_start + 75 s * scale`.
+        let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let real_window = Duration::try_minutes(30).unwrap();
+        let logical_window = Duration::try_days(14).unwrap();
+        let tm = TimeMap::new(logical_start, real_start, real_window, logical_window).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[DATE_MS_LINE]);
+        let (max_ts, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
+        assert!(diag.is_empty());
+        // Wire form must remain `\/Date(<new_ms>)\/`.
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains(r"\/Date("), "DateMs wire form must survive: {s}");
+        // The fixture records `2026-01-15T09:01:15Z`, 75 s past
+        // `real_start`. Derive the scaled logical offset from the map's
+        // window durations rather than a hard-coded ms literal so the
+        // assertion fails on any arithmetic regression — millisecond
+        // rounding, sign error, or off-by-one in the affine map.
+        let real_offset = Duration::try_seconds(75).unwrap();
+        let expected = logical_start
+            + Duration::milliseconds(
+                real_offset.num_milliseconds() * logical_window.num_milliseconds()
+                    / real_window.num_milliseconds(),
+            );
+        assert_eq!(max_ts.unwrap(), expected);
+    }
+
+    // ── anchor preservation ───────────────────────────────────────
+
+    #[test]
+    fn anchor_burst_preserves_intra_session_spacing() {
+        // 30 real minutes → 14 logical days. Two `\/Date(<ms>)\/`
+        // records inside one execution window must keep their real
+        // 100 ms spacing, the first record must land exactly at the
+        // anchor's `logical_start`, and both lines must retain the
+        // escaped-slash wire form (no normalization to bare slashes).
+        use std::net::Ipv4Addr;
+
+        use crate::activity::Execution;
+        use crate::scenario::Protocol;
+        use crate::time::build_anchors;
+
         let real_start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
         let logical_start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
         let tm = TimeMap::new(
@@ -902,18 +943,81 @@ mod tests {
             Duration::try_days(14).unwrap(),
         )
         .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let p = write_lines(dir.path(), &[DATE_MS_LINE]);
-        let (max_ts, diag) = rewrite_timestamps(&p, &tm, &[]).unwrap();
-        assert!(diag.is_empty());
-        // Wire form must remain `\/Date(<new_ms>)\/`.
-        let s = std::fs::read_to_string(&p).unwrap();
-        assert!(s.contains(r"\/Date("), "DateMs wire form must survive: {s}");
-        // Sanity: max_ts is the rewritten ts of the only record.
-        assert!(max_ts.is_some());
-        assert_ne!(
-            max_ts.unwrap(),
-            Utc.with_ymd_and_hms(2026, 1, 15, 9, 1, 15).unwrap()
+        let exec_start = real_start + Duration::try_seconds(10).unwrap();
+        let exec_end = exec_start + Duration::try_seconds(1).unwrap();
+        let exec = Execution {
+            start: exec_start,
+            end: exec_end,
+            source: "a".into(),
+            target: "b".into(),
+            protocol: Protocol::Tcp,
+            src_ip: Ipv4Addr::new(10, 0, 0, 2),
+            src_port: 0,
+            dst_ip: Ipv4Addr::new(10, 0, 0, 3),
+            dst_port: 80,
+            attack: None,
+            exit_code: 0,
+            command: String::new(),
+        };
+        let (anchors, _) = build_anchors(&[exec], &tm).unwrap();
+
+        let burst_b = exec_start + Duration::milliseconds(100);
+        let line_a = format!(
+            r#"{{"TimeCreated":"\/Date({})\/","Id":4688}}"#,
+            exec_start.timestamp_millis(),
         );
+        let line_b = format!(
+            r#"{{"TimeCreated":"\/Date({})\/","Id":4689}}"#,
+            burst_b.timestamp_millis(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_lines(dir.path(), &[&line_a, &line_b]);
+        let (max_ts, diag) = rewrite_timestamps(&p, &tm, &anchors).unwrap();
+        assert!(diag.is_empty());
+
+        let content = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Parse the embedded ms integer back to a `DateTime<Utc>` so a
+        // millisecond-rounding regression in the rewriter fails this
+        // test — checking only the wire-form spelling would not.
+        let parse_date_ms = |line: &str| -> DateTime<Utc> {
+            let v: serde_json::Value = serde_json::from_str(line).expect("JSON parse");
+            // `serde_json` decodes `\/` to `/`, so the surfaced value
+            // is the bare-slash form regardless of the on-wire spelling.
+            let raw = v["TimeCreated"].as_str().expect("TimeCreated string");
+            let inner = raw
+                .strip_prefix("/Date(")
+                .and_then(|r| r.strip_suffix(")/"))
+                .expect("/Date(<ms>)/ payload");
+            let ms: i64 = inner.parse().expect("ms integer");
+            Utc.timestamp_millis_opt(ms).single().expect("valid ms")
+        };
+        let a = parse_date_ms(lines[0]);
+        let b = parse_date_ms(lines[1]);
+        assert_eq!(a, anchors[0].logical_start);
+        assert_eq!(b - a, Duration::milliseconds(100));
+        assert_eq!(max_ts.unwrap(), b);
+
+        // Wire form: both lines must retain the escaped `\/Date(`
+        // spelling and must NOT have been promoted/demoted between
+        // the two `DateMs` spellings.
+        for line in &lines {
+            assert!(
+                line.contains(r"\/Date("),
+                "escaped slashes must survive: {line}",
+            );
+            assert!(
+                !line.contains("\"/Date("),
+                "escaped form must not be normalized to bare slashes: {line}",
+            );
+        }
+
+        // Sanity: the anchor's logical_start is the global-map image
+        // of `exec_start`, not the bare `logical_start` constant — the
+        // 10 s real offset is scaled before the anchor lands.
+        assert_ne!(anchors[0].logical_start, logical_start);
     }
 }
