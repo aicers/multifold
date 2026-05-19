@@ -81,6 +81,38 @@ jobs:
       - name: Validate AC-0 bundle
         run: cargo run --release -- validate -b ac0-bundle
 
+  ac0-compressed-pipeline:
+    name: AC-0 Compressed Pipeline
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Generate AC-0 compressed bundle
+        run: cargo run --release -- generate -s scenarios/ac-0-compressed.scenario.yaml -o ac0c-bundle
+
+      - name: Validate AC-0 compressed bundle
+        run: cargo run --release -- validate -b ac0c-bundle
+
+      - name: Assert meta.json invariants
+        run: python3 .github/scripts/check_ac0_compressed_meta.py ac0c-bundle/meta.json
+
+      - name: Assert ground_truth manifest invariants
+        run: python3 .github/scripts/check_ac0_compressed_gt.py ac0c-bundle/ground_truth/manifest.jsonl
+
+      - name: Assert pcap structural invariants
+        run: python3 .github/scripts/check_ac0_compressed_pcap.py ac0c-bundle/net/lan.pcap
+
   docker-e2e:
     name: Docker E2E
     needs: [check]

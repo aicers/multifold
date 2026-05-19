@@ -487,4 +487,122 @@ mod tests {
         .unwrap();
         assert_eq!(meta.duration.actual_end, meta.duration.actual_start);
     }
+
+    /// Loads the compressed AC-0 scenario together with the canonical
+    /// non-identity inputs the meta tests need:
+    ///
+    /// * `start` — the run's `real_generation_start` (`Utc::now()` stand-in).
+    /// * `logical_start` — the scenario's declared `start_at`.
+    fn ac0_compressed_test_inputs() -> (Scenario, HostIps, DateTime<Utc>, DateTime<Utc>) {
+        let yaml = include_str!("../scenarios/ac-0-compressed.scenario.yaml");
+        let scenario: Scenario = serde_yaml::from_str(yaml).unwrap();
+        let host_ips = vec![
+            (
+                "attacker-001".to_owned(),
+                vec![Ipv4Addr::new(10, 101, 0, 2)],
+            ),
+            ("target-001".to_owned(), vec![Ipv4Addr::new(10, 101, 0, 3)]),
+        ];
+        let start = DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let logical_start = scenario.start_at.unwrap();
+        (scenario, host_ips, start, logical_start)
+    }
+
+    fn ac0_compressed_time_map(
+        scenario: &Scenario,
+        real_generation_start: DateTime<Utc>,
+        logical_start: DateTime<Utc>,
+    ) -> TimeMap {
+        let real_duration = parse_duration(&scenario.duration).unwrap();
+        let logical_duration =
+            parse_duration(scenario.logical_duration.as_deref().unwrap()).unwrap();
+        TimeMap::new(
+            logical_start,
+            real_generation_start,
+            real_duration,
+            logical_duration,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn build_meta_compressed_generated_at_is_real_not_logical() {
+        let (scenario, host_ips, start, logical_start) = ac0_compressed_test_inputs();
+        let tm = ac0_compressed_time_map(&scenario, start, logical_start);
+        let meta = build(
+            "ac-0-compressed.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            logical_start,
+            &[],
+        )
+        .unwrap();
+        // generated_at carries the real wall-clock at run start, not the
+        // scenario's logical start_at.
+        assert_eq!(meta.generated_at, "2026-01-15T09:00:00Z");
+        assert_ne!(meta.generated_at, "2026-05-03T00:00:00Z");
+    }
+
+    #[test]
+    fn build_meta_compressed_actual_start_equals_start_at() {
+        let (scenario, host_ips, start, logical_start) = ac0_compressed_test_inputs();
+        let tm = ac0_compressed_time_map(&scenario, start, logical_start);
+        let meta = build(
+            "ac-0-compressed.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            logical_start,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(meta.duration.actual_start, "2026-05-03T00:00:00Z");
+    }
+
+    #[test]
+    fn build_meta_compressed_total_is_logical_duration() {
+        let (scenario, host_ips, start, logical_start) = ac0_compressed_test_inputs();
+        let tm = ac0_compressed_time_map(&scenario, start, logical_start);
+        let meta = build(
+            "ac-0-compressed.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            logical_start,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(meta.duration.total, "14d");
+    }
+
+    #[test]
+    fn build_meta_compressed_actual_end_within_logical_window() {
+        let (scenario, host_ips, start, logical_start) = ac0_compressed_test_inputs();
+        let tm = ac0_compressed_time_map(&scenario, start, logical_start);
+        // Caller-aggregated end: 10 logical days past start_at — within
+        // the second activity's anchor window for a typical normal run.
+        let aggregated_end = logical_start + Duration::try_days(10).unwrap();
+        let meta = build(
+            "ac-0-compressed.scenario.yaml",
+            &scenario,
+            &host_ips,
+            &tm,
+            aggregated_end,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(meta.duration.actual_end, "2026-05-13T00:00:00Z");
+
+        let parsed_end = DateTime::parse_from_rfc3339(&meta.duration.actual_end)
+            .unwrap()
+            .with_timezone(&Utc);
+        let parsed_start = DateTime::parse_from_rfc3339(&meta.duration.actual_start)
+            .unwrap()
+            .with_timezone(&Utc);
+        let upper = logical_start + Duration::try_days(14).unwrap();
+        assert!(parsed_end >= parsed_start && parsed_end <= upper);
+    }
 }
