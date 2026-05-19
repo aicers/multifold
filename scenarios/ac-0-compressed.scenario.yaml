@@ -1,0 +1,63 @@
+version: "1"
+
+metadata:
+  name: ac-0-compressed
+  description: >-
+    Compressed variant of ac-0 used to demonstrate end-to-end
+    time-compression in CI: same infrastructure and commands, but
+    fixed start_at and a 14d logical_duration over a 5m real
+    duration (scale_factor = 4032). The two activities are spaced
+    5d / 10d apart in logical time to keep anchor windows overlap
+    free even on slow CI runners.
+
+environment:
+  scale: minimal
+  encryption: none
+  workload: light
+  threat: single
+  attacker: scripted
+
+start_at: "2026-05-03T00:00:00Z"
+duration: 5m
+logical_duration: 14d
+
+infrastructure:
+  hosts:
+    - name: attacker-001
+      os: linux
+      role: attacker
+      image: alpine:3.19
+    - name: target-001
+      os: linux
+      role: target
+      image: alpine:3.19
+      setup:
+        - "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 80 > /dev/null; done &"
+  network:
+    segments:
+      - name: lan
+        subnet: 10.101.0.0/24
+        hosts:
+          - attacker-001
+          - target-001
+
+activities:
+  normal:
+    - name: http-health-check
+      source: attacker-001
+      target: target-001
+      command: "curl -s http://${target_ip}:80/"
+      protocol: tcp
+      dst_port: 80
+      start_offset: 5d
+  attack:
+    - name: nmap-port-scan
+      source: attacker-001
+      target: target-001
+      command: "nmap -sS -p 80 ${target_ip}"
+      protocol: tcp
+      dst_port: 80
+      technique: T1046
+      phase: reconnaissance
+      tool: nmap
+      start_offset: 10d

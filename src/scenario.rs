@@ -1885,6 +1885,23 @@ activities:
         assert_eq!(s.activities.attack.len(), 2);
     }
 
+    #[test]
+    fn load_ac0_compressed_from_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scenarios")
+            .join("ac-0-compressed.scenario.yaml");
+        let s = load(&path).unwrap();
+        assert_eq!(s.metadata.name, "ac-0-compressed");
+        assert_eq!(s.duration, "5m");
+        assert_eq!(s.logical_duration.as_deref(), Some("14d"));
+        let start_at = s.start_at.expect("start_at should parse");
+        assert_eq!(start_at.to_rfc3339(), "2026-05-03T00:00:00+00:00");
+        assert_eq!(s.activities.normal.len(), 1);
+        assert_eq!(s.activities.attack.len(), 1);
+        assert_eq!(s.activities.normal[0].start_offset, "5d");
+        assert_eq!(s.activities.attack[0].start_offset, "10d");
+    }
+
     // ── Vantage point ────────────────────────────────────────────
 
     #[test]
