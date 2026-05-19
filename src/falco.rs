@@ -90,6 +90,17 @@ pub(crate) async fn collect_logs(
 /// (or `None` when no record was rewritten) and a diagnostic counter
 /// the call site renders into a per-file warning line.
 ///
+/// Falco JSONL is treated as having a single rewritten timestamp field,
+/// `time`. This matches the validator's `FALCO_REQUIRED_FIELDS` in
+/// `src/validator.rs`, where `time` is the only timestamp-bearing entry
+/// consumed downstream (via the L2-009 required-field check; Falco has
+/// no L4 cross-source check at present). If a future Falco version or
+/// rule set introduces additional timestamp fields that downstream
+/// consumers care about, extend this rewriter and revisit the
+/// validator's Falco checks accordingly. See
+/// `sysmon::rewrite_timestamps` for the analogous `TimeCreated`-only
+/// scope statement on the Sysmon side.
+///
 /// Malformed lines, records missing the `time` field, and unparseable
 /// timestamp values pass through unchanged with their respective
 /// counters incremented. Records whose rewritten timestamp lands

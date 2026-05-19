@@ -137,6 +137,17 @@ pub(crate) async fn collect_logs(vm_host: &ProvisionedVm, output_dir: &Path) -> 
 /// dual wire format (`\/Date(<ms>)\/` for Windows PowerShell 5.1, ISO
 /// 8601 for PowerShell 7+) and the requirement to preserve the input
 /// offset and fractional precision on round-trip.
+///
+/// Sysmon JSONL is treated as having a single rewritten timestamp
+/// field, `TimeCreated`. This is the only timestamp-bearing entry
+/// emitted by the `Get-WinEvent | ConvertTo-Json -Compress` capture
+/// path used in `collect_logs`, and matches the field consumed by the
+/// validator's L4-002 process↔Sysmon overlap check in
+/// `src/validator.rs`. If a future Sysmon schema or capture variant
+/// introduces additional timestamp fields that downstream consumers
+/// care about, extend this rewriter and revisit the validator
+/// accordingly. See `falco::rewrite_timestamps` for the analogous
+/// `time`-only scope statement on the Falco side.
 pub(crate) fn rewrite_timestamps(
     path: &Path,
     time_map: &TimeMap,
