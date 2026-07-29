@@ -169,18 +169,44 @@ fn write_u32(data: &mut [u8], offset: usize, value: u32, le: bool) {
     }
 }
 
+/// A record whose timestamp has been rewritten in place, paired with the
+/// byte range it occupies in the source buffer.
+///
+/// The range spans the 16-byte record header plus its payload, so the
+/// reassembly step can emit records in a new order without copying each
+/// one into its own buffer.
+///
+/// `ts_us` is the microsecond value actually written into the record,
+/// not the full-precision logical timestamp: sorting on the stored
+/// value keeps "same key" and "same bytes on disk" the same thing, so a
+/// sub-microsecond tail can never split records that the output file
+/// shows as simultaneous.
+struct RewrittenRecord {
+    ts_us: i64,
+    start: usize,
+    end: usize,
+}
+
 /// Rewrites every packet record's `(ts_sec, ts_usec)` in `path` from
-/// real wall-clock to the logical timeline via [`rewrite_ts`].
+/// real wall-clock to the logical timeline via [`rewrite_ts`], then
+/// emits the records ordered by their rewritten timestamp.
 ///
 /// Returns the maximum rewritten timestamp seen, or `None` if the file
 /// has zero packet records. The aggregator in `assemble_bundle` folds
 /// this in with the GT max to seed `meta.actual_end`.
 ///
 /// Walks the raw byte stream (not [`parse_ethernet_packet`]) so non-IPv4
-/// records (ARP, IPv6, LLDP, …) are also rewritten — the output file
-/// stays byte-identical to the input except for the eight rewritten
-/// timestamp bytes per record. `incl_len`, `orig_len`, and packet
-/// payloads are left untouched.
+/// records (ARP, IPv6, LLDP, …) are also rewritten and preserved.
+/// The only things that change are each record's eight timestamp bytes
+/// and the order of the records; `incl_len`, `orig_len`, and packet
+/// payloads are left untouched, and no record is ever dropped.
+///
+/// Reordering is what guarantees the output is monotonically
+/// non-decreasing even when bridge/kernel timestamping hands us a
+/// capture whose records regress by a few hundred µs. The sort is
+/// stable, so records sharing a logical timestamp keep their capture
+/// order. Consequently the output is byte-identical to the input only
+/// when the rewritten timestamps are already non-decreasing.
 #[allow(clippy::similar_names)] // ts_sec / ts_usec are pcap spec field names
 pub(crate) fn rewrite_timestamps(
     path: &Path,
@@ -215,6 +241,7 @@ pub(crate) fn rewrite_timestamps(
     };
 
     let mut offset = GLOBAL_HEADER_LEN;
+    let mut records: Vec<RewrittenRecord> = Vec::new();
     let mut max_ts: Option<DateTime<Utc>> = None;
     let mut out_of_range_seen = false;
     let logical_end = time_map
@@ -272,7 +299,13 @@ pub(crate) fn rewrite_timestamps(
             max_ts = Some(logical_ts);
         }
 
-        offset = pkt_start + incl_len_us;
+        let record_end = pkt_start + incl_len_us;
+        records.push(RewrittenRecord {
+            ts_us: i64::from(new_ts_sec) * 1_000_000 + i64::from(new_ts_usec),
+            start: offset,
+            end: record_end,
+        });
+        offset = record_end;
     }
 
     if out_of_range_seen {
@@ -282,10 +315,45 @@ pub(crate) fn rewrite_timestamps(
         );
     }
 
-    write_atomic(path, &data)
+    let out = if records.is_sorted_by_key(|record| record.ts_us) {
+        // Already monotonic — the overwhelmingly common case, since
+        // only capture jitter breaks the order. Reassembly would copy
+        // `data` back byte for byte, so write it as it stands and skip
+        // a second full-file buffer.
+        data
+    } else {
+        // Stable on purpose: records sharing a logical timestamp must
+        // keep their capture order so the output stays deterministic
+        // and the reordering is the minimal one that restores
+        // monotonicity.
+        records.sort_by_key(|record| record.ts_us);
+        reassemble(&data, &records, offset)
+    };
+    write_atomic(path, &out)
         .with_context(|| format!("failed to write pcap: {}", path.display()))?;
 
     Ok(max_ts)
+}
+
+/// Rebuilds the file from the original global header, the records in
+/// `records` order, and the bytes from `tail_start` onward (a truncated
+/// trailing record, preserved verbatim).
+fn reassemble(data: &[u8], records: &[RewrittenRecord], tail_start: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(
+        data.get(..GLOBAL_HEADER_LEN)
+            .expect("len >= GLOBAL_HEADER_LEN checked by the caller"),
+    );
+    for record in records {
+        out.extend_from_slice(
+            data.get(record.start..record.end)
+                .expect("record range was bounds-checked during the walk"),
+        );
+    }
+    if let Some(tail) = data.get(tail_start..) {
+        out.extend_from_slice(tail);
+    }
+    out
 }
 
 /// Atomically replaces `path` with `data` by writing to a sibling
@@ -1342,6 +1410,517 @@ mod tests {
         let tm = identity_map_for(start);
         let max_ts = rewrite_timestamps(&dir.path().join("many.pcap"), &tm, &[]).unwrap();
         assert_eq!(max_ts, Some(fixed_ts(1_000_000_010)));
+    }
+
+    /// Reads back the `(ts_us, src_port)` of every record in a rewritten
+    /// capture, in file order. `src_port` identifies which input record
+    /// a given output record came from.
+    fn record_order(path: &Path) -> Vec<(i64, u16)> {
+        parse_pcap(path)
+            .unwrap()
+            .iter()
+            .map(|p| (p.ts_us, p.src_port))
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_reorders_regressed_timestamps() {
+        // Capture jitter: the second record regresses 100 ms behind the
+        // first. The rewriter must emit a monotonic file.
+        let dir = tempfile::tempdir().unwrap();
+        write_pcap(
+            dir.path(),
+            "jitter.pcap",
+            &[
+                (
+                    1_000_000_000,
+                    200_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80),
+                ),
+                (
+                    1_000_000_000,
+                    100_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80),
+                ),
+                (
+                    1_000_000_001,
+                    0,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 3, 80),
+                ),
+            ],
+        );
+        let path = dir.path().join("jitter.pcap");
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        let max_ts = rewrite_timestamps(&path, &tm, &[]).unwrap();
+        assert_eq!(max_ts, Some(fixed_ts(1_000_000_001)));
+
+        let order = record_order(&path);
+        assert_eq!(
+            order,
+            vec![
+                (1_000_000_000_100_000, 2),
+                (1_000_000_000_200_000, 1),
+                (1_000_000_001_000_000, 3),
+            ],
+        );
+        assert!(order.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn rewrite_keeps_capture_order_for_equal_timestamps() {
+        // Records 1 and 3 share a logical timestamp; the stable sort must
+        // leave them in capture order after record 2 moves ahead of them.
+        let dir = tempfile::tempdir().unwrap();
+        write_pcap(
+            dir.path(),
+            "ties.pcap",
+            &[
+                (
+                    1_000_000_000,
+                    500_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80),
+                ),
+                (
+                    1_000_000_000,
+                    300_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80),
+                ),
+                (
+                    1_000_000_000,
+                    500_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 3, 80),
+                ),
+            ],
+        );
+        let path = dir.path().join("ties.pcap");
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        assert_eq!(
+            record_order(&path),
+            vec![
+                (1_000_000_000_300_000, 2),
+                (1_000_000_000_500_000, 1),
+                (1_000_000_000_500_000, 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_capture_order_across_a_tie_heavy_burst() {
+        // The three-record tie case above cannot tell a stable sort from
+        // an unstable one: `sort_unstable_by_key` falls back to insertion
+        // sort — which happens to be stable — for short slices. This
+        // burst is long enough to reach the real pattern-defeating
+        // quicksort path, where equal keys do get reordered, so it is
+        // what actually locks the stability requirement in.
+        const BURST_LEN: usize = 33;
+        const PKTS_PER_US: usize = 3; // packets sharing one microsecond
+        const REGRESS_EVERY: usize = 7; // every Nth packet arrives late
+        const REGRESS_US: u32 = 150;
+        const BASE_US: u32 = 500_000;
+        const STEP_US: u32 = 100;
+        const BASE_SEC: u32 = 1_000_000_000;
+
+        // Bursts of PKTS_PER_US packets sharing a microsecond, with a
+        // periodic backwards jump — the shape bridge timestamping gives
+        // us, but with far more ties than the small cases.
+        let jittered_us = |i: usize| -> u32 {
+            let group = u32::try_from(i / PKTS_PER_US).expect("i < BURST_LEN");
+            let base = BASE_US + group * STEP_US;
+            if i.is_multiple_of(REGRESS_EVERY) {
+                base - REGRESS_US
+            } else {
+                base
+            }
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<(u32, u32, Vec<u8>)> = (0..BURST_LEN)
+            .map(|i| {
+                let port = u16::try_from(i).expect("i < BURST_LEN") + 1;
+                (
+                    BASE_SEC,
+                    jittered_us(i),
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], port, 80),
+                )
+            })
+            .collect();
+        write_pcap(dir.path(), "burst.pcap", &records);
+        let path = dir.path().join("burst.pcap");
+
+        let tm = identity_map_for(fixed_ts(i64::from(BASE_SEC)));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        let base_us = i64::from(BASE_SEC) * 1_000_000;
+        let mut expected: Vec<(i64, u16)> = (0..BURST_LEN)
+            .map(|i| {
+                (
+                    base_us + i64::from(jittered_us(i)),
+                    u16::try_from(i).expect("i < BURST_LEN") + 1,
+                )
+            })
+            .collect();
+        expected.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(record_order(&path), expected);
+    }
+
+    #[test]
+    fn rewrite_monotonic_input_is_byte_identical() {
+        // Several records already in order: reassembly must reproduce the
+        // input byte for byte, including incl_len/orig_len and payloads.
+        let dir = tempfile::tempdir().unwrap();
+        write_pcap(
+            dir.path(),
+            "sorted.pcap",
+            &[
+                (
+                    1_737_000_000,
+                    0,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80),
+                ),
+                (
+                    1_737_000_000,
+                    500_000,
+                    udp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 53),
+                ),
+                (
+                    1_737_000_001,
+                    0,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 3, 80),
+                ),
+            ],
+        );
+        let path = dir.path().join("sorted.pcap");
+        let before = std::fs::read(&path).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_737_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn rewrite_monotonic_input_preserves_truncated_tail() {
+        // The shape a live capture actually has: records already in
+        // order, plus a record tcpdump was still writing. Nothing gets
+        // reordered, and the half-written tail survives verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let first = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let second = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80);
+        let tail: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+        let mut data = pcap_global_header();
+        data.extend(pcap_packet_record(1_000_000_000, 100_000, &first));
+        data.extend(pcap_packet_record(1_000_000_000, 200_000, &second));
+        data.extend_from_slice(&tail);
+        let path = dir.path().join("monotonic-trunc.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        let max_ts = rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        assert_eq!(
+            max_ts,
+            Some(fixed_ts(1_000_000_000) + Duration::microseconds(200_000)),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    #[test]
+    fn rewrite_reorders_and_preserves_truncated_tail() {
+        // A regression plus a half-written trailing record header: the
+        // records get sorted, the tail bytes survive verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let late = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let early = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80);
+        let tail: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+        let late_record = pcap_packet_record(1_000_000_000, 200_000, &late);
+        let early_record = pcap_packet_record(1_000_000_000, 100_000, &early);
+        let mut data = pcap_global_header();
+        data.extend_from_slice(&late_record);
+        data.extend_from_slice(&early_record);
+        data.extend_from_slice(&tail);
+        let path = dir.path().join("trunc.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        let mut expected = pcap_global_header();
+        expected.extend_from_slice(&early_record);
+        expected.extend_from_slice(&late_record);
+        expected.extend_from_slice(&tail);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rewrite_preserves_tail_of_record_with_truncated_payload() {
+        // The other truncation shape: a complete 16-byte record header
+        // whose payload is cut short. The walk stops before it, so its
+        // header must not be mistaken for a rewritable record and must
+        // land after the sorted ones, unaltered.
+        let dir = tempfile::tempdir().unwrap();
+        let late = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let early = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80);
+        let partial = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 3, 80);
+        let late_record = pcap_packet_record(1_000_000_000, 200_000, &late);
+        let early_record = pcap_packet_record(1_000_000_000, 100_000, &early);
+        // Header claims the full payload, but only half of it is present.
+        let mut partial_record = pcap_packet_record(1_000_000_000, 50_000, &partial);
+        partial_record.truncate(PACKET_HEADER_LEN + partial.len() / 2);
+        let mut data = pcap_global_header();
+        data.extend_from_slice(&late_record);
+        data.extend_from_slice(&early_record);
+        data.extend_from_slice(&partial_record);
+        let path = dir.path().join("half-payload.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        let max_ts = rewrite_timestamps(&path, &tm, &[]).unwrap();
+        // The truncated record is not walked, so it does not contribute.
+        assert_eq!(
+            max_ts,
+            Some(fixed_ts(1_000_000_000) + Duration::microseconds(200_000)),
+        );
+
+        let mut expected = pcap_global_header();
+        expected.extend_from_slice(&early_record);
+        expected.extend_from_slice(&late_record);
+        expected.extend_from_slice(&partial_record);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rewrite_leaves_file_untouched_when_a_later_record_is_malformed() {
+        // The first record rewrites fine, the second is malformed. The
+        // rewrite is all-or-nothing: nothing is written, so the capture
+        // keeps its original bytes rather than a half-rewritten mix.
+        let dir = tempfile::tempdir().unwrap();
+        let good = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let bad = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80);
+        let mut data = pcap_global_header();
+        data.extend(pcap_packet_record(1_000_000_000, 0, &good));
+        data.extend(pcap_packet_record(1_000_000_000, 1_000_000, &bad));
+        let path = dir.path().join("malformed.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let real_start = fixed_ts(1_000_000_000);
+        let tm = TimeMap::new(
+            fixed_ts(2_000_000_000),
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_minutes(30).unwrap(),
+        )
+        .unwrap();
+        let err = rewrite_timestamps(&path, &tm, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("ts_usec"),
+            "unexpected error: {err}",
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    #[test]
+    fn rewrite_reorders_non_ipv4_records() {
+        // A non-IPv4 record (IPv6 ethertype) regresses behind an IPv4
+        // one. parse_pcap drops it, so check the raw bytes: it must be
+        // preserved and moved to the front.
+        let dir = tempfile::tempdir().unwrap();
+        let ipv4 = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let mut ipv6 = tcp_frame([10, 0, 0, 1], [10, 0, 0, 2], 2, 200);
+        ipv6[12] = 0x86;
+        ipv6[13] = 0xDD;
+        let mut data = pcap_global_header();
+        data.extend(pcap_packet_record(1_000_000_000, 200_000, &ipv4));
+        data.extend(pcap_packet_record(1_000_000_000, 100_000, &ipv6));
+        let path = dir.path().join("v6-jitter.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        let mut expected = pcap_global_header();
+        expected.extend(pcap_packet_record(1_000_000_000, 100_000, &ipv6));
+        expected.extend(pcap_packet_record(1_000_000_000, 200_000, &ipv4));
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rewrite_reorders_big_endian_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let late = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80);
+        let early = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80);
+        let mut data = pcap_global_header_endian(false);
+        data.extend(pcap_packet_record_endian(
+            1_000_000_000,
+            200_000,
+            &late,
+            false,
+        ));
+        data.extend(pcap_packet_record_endian(
+            1_000_000_000,
+            100_000,
+            &early,
+            false,
+        ));
+        let path = dir.path().join("be-jitter.pcap");
+        std::fs::write(&path, &data).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        let mut expected = pcap_global_header_endian(false);
+        expected.extend(pcap_packet_record_endian(
+            1_000_000_000,
+            100_000,
+            &early,
+            false,
+        ));
+        expected.extend(pcap_packet_record_endian(
+            1_000_000_000,
+            200_000,
+            &late,
+            false,
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rewrite_orders_by_logical_not_real_timestamp() {
+        // Anchored compression can reorder records relative to real time:
+        // a background packet captured before an execution's packet can
+        // map to a later logical instant. The sort key must be the
+        // post-rewrite timestamp.
+        let dir = tempfile::tempdir().unwrap();
+        let real_start = fixed_ts(1_000_000_000);
+        // Background packet 1 s in — compressed 672x, so it lands very
+        // early on the logical timeline.
+        let bg_ts = real_start + Duration::try_seconds(1).unwrap();
+        // Execution 20 min in — its anchor pins it far later logically.
+        let exec_start = real_start + Duration::try_minutes(20).unwrap();
+        let exec_pkt_ts = exec_start + Duration::milliseconds(10);
+        let to_pair = |t: DateTime<Utc>| -> (u32, u32) {
+            (
+                u32::try_from(t.timestamp()).unwrap(),
+                t.timestamp_subsec_micros(),
+            )
+        };
+        let (background_sec, background_us) = to_pair(bg_ts);
+        let (exec_sec, exec_us) = to_pair(exec_pkt_ts);
+        // Capture order: execution packet first, background second.
+        write_pcap(
+            dir.path(),
+            "logical.pcap",
+            &[
+                (
+                    exec_sec,
+                    exec_us,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80),
+                ),
+                (
+                    background_sec,
+                    background_us,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80),
+                ),
+            ],
+        );
+        let path = dir.path().join("logical.pcap");
+
+        let tm = TimeMap::new(
+            fixed_ts(2_000_000_000),
+            real_start,
+            Duration::try_minutes(30).unwrap(),
+            Duration::try_days(14).unwrap(),
+        )
+        .unwrap();
+        let exec = Execution {
+            start: exec_start,
+            end: exec_start + Duration::try_seconds(1).unwrap(),
+            source: "a".into(),
+            target: "b".into(),
+            protocol: Protocol::Tcp,
+            src_ip: Ipv4Addr::new(10, 0, 0, 2),
+            src_port: 0,
+            dst_ip: Ipv4Addr::new(10, 0, 0, 3),
+            dst_port: 80,
+            attack: None,
+            exit_code: 0,
+            command: String::new(),
+        };
+        let (anchors, _) = build_anchors(std::slice::from_ref(&exec), &tm).unwrap();
+        rewrite_timestamps(&path, &tm, &anchors).unwrap();
+
+        let order = record_order(&path);
+        // Background (src_port 2) now precedes the execution packet.
+        assert_eq!(
+            order.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(order.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn rewrite_sorts_heavily_jittered_capture_without_losing_records() {
+        // Repeated regressions and duplicate timestamps, the shape
+        // bridge timestamping produces. Beyond monotonicity this locks
+        // in that every record survives exactly once and the file size
+        // is unchanged, which the three-record cases are too small to
+        // catch if the index bookkeeping ever slips.
+        const JITTERED_US: [u32; 12] = [
+            500_000, 499_600, 499_600, 700_000, 650_000, 650_000, 900_000, 899_000, 100_000,
+            950_000, 950_000, 940_000,
+        ];
+        const BASE_SEC: u32 = 1_000_000_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<(u32, u32, Vec<u8>)> = JITTERED_US
+            .iter()
+            .enumerate()
+            .map(|(i, us)| {
+                let port = u16::try_from(i).unwrap() + 1;
+                (
+                    BASE_SEC,
+                    *us,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], port, 80),
+                )
+            })
+            .collect();
+        write_pcap(dir.path(), "jittery.pcap", &records);
+        let path = dir.path().join("jittery.pcap");
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        let tm = identity_map_for(fixed_ts(i64::from(BASE_SEC)));
+        let max_ts = rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        let order = record_order(&path);
+        assert!(
+            order.windows(2).all(|w| w[0].0 <= w[1].0),
+            "output is not monotonic: {order:?}",
+        );
+
+        let mut ports: Vec<u16> = order.iter().map(|(_, p)| *p).collect();
+        ports.sort_unstable();
+        assert_eq!(ports, (1..=12).collect::<Vec<u16>>());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+
+        // Stable sort: ties keep capture order, so the derived
+        // expectation pins the exact output sequence.
+        let base_us = i64::from(BASE_SEC) * 1_000_000;
+        let mut expected: Vec<(i64, u16)> = JITTERED_US
+            .iter()
+            .enumerate()
+            .map(|(i, us)| (base_us + i64::from(*us), u16::try_from(i).unwrap() + 1))
+            .collect();
+        expected.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(order, expected);
+
+        let latest_us = JITTERED_US.iter().copied().max().unwrap();
+        assert_eq!(
+            max_ts,
+            Some(fixed_ts(i64::from(BASE_SEC)) + Duration::microseconds(i64::from(latest_us))),
+        );
     }
 
     #[test]
