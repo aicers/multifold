@@ -838,6 +838,17 @@ mod tests {
         let pcap_len = fs::metadata(&pcap_path).unwrap().len();
         assert!(pcap_len > 24, "pcap must be larger than the global header");
 
+        // Bridge timestamping can hand the rewriter a capture whose
+        // records regress by a few hundred µs; the rewritten file must
+        // come out ordered regardless. Unit tests pin this on synthetic
+        // jitter — this is the same invariant on a real capture.
+        let packets = pcap::parse_pcap(&pcap_path).unwrap();
+        assert!(
+            packets.windows(2).all(|w| w[0].ts_us <= w[1].ts_us),
+            "rewritten pcap timestamps are not monotonically non-decreasing: {:?}",
+            packets.iter().map(|p| p.ts_us).collect::<Vec<_>>(),
+        );
+
         // ── meta.json ────────────────────────────────────────────
         let meta_path = output_dir.join("meta.json");
         assert!(meta_path.exists(), "meta.json was not created");
