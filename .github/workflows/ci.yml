@@ -15,6 +15,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Ungated and standalone, matching `aicers/roxyd` and `aicers/agentcoop`. Kept
+  # out of `check` so a clippy failure cannot hide the Markdown result, and so
+  # the lint survives if the expensive jobs are ever put behind a path filter.
+  markdown:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: "**/*.md"
+
   check:
     name: Quality Check
     runs-on: ubuntu-latest
