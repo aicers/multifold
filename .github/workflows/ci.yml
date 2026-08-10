@@ -21,6 +21,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Ungated and unconditional: AGENTS.md is itself Markdown, so a
+  # documentation-only change is exactly the change that can edit a
+  # generated region.
+  #
+  # No `with:` block. The release to compare against and the blocks to
+  # compare are both read from `.agents/instructions.toml`, so they have one
+  # source rather than two that can disagree, and the apply job that
+  # rewrites them never has to touch `.github/workflows/` -- which the
+  # default GITHUB_TOKEN may not push to. The pin is a release tag rather
+  # than a branch, so an edit upstream reaches this repository through the
+  # pull request that moves it instead of turning every unrelated pull
+  # request red.
+  instructions:
+    name: Instructions
+    uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
+
   # Ungated and standalone, matching `aicers/roxyd` and `aicers/agentcoop`. Kept
   # out of `check` so a clippy failure cannot hide the Markdown result, and so
   # the lint survives if the expensive jobs are ever put behind a path filter.
