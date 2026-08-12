@@ -1,4 +1,7 @@
+use std::fs::{OpenOptions, Permissions};
+use std::io::Write;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -30,6 +33,12 @@ const PCAPNG_SHB_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 
 const TS_USEC_MAX_EXCLUSIVE: u32 = 1_000_000;
 const U32_MAX_AS_I64: i64 = u32::MAX as i64;
+
+/// Mode a rewritten capture ends up with, whatever mode it arrived
+/// with. See [`write_atomic`] for why it is decided here.
+const CAPTURE_MODE: u32 = 0o644;
+/// Ceiling on the staging temporary's mode while it is being filled.
+const STAGING_MODE: u32 = 0o600;
 
 /// Extracts source ports from pcap captures and fills them into the
 /// corresponding executions.
@@ -364,6 +373,11 @@ fn reassemble(data: &[u8], records: &[RewrittenRecord], tail_start: usize) -> Ve
 /// with `EACCES`. Renaming only requires write+execute on the parent
 /// directory, which the host user does own, and is atomic so a crash
 /// mid-write cannot leave a half-rewritten PCAP behind.
+///
+/// The rename puts the temporary's inode at the destination, so the
+/// finished capture carries the temporary's mode rather than the one
+/// the file it replaced had. That mode is therefore decided here — see
+/// [`stage_tmp`] — instead of being whatever the process umask left.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
@@ -377,15 +391,55 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     // Best-effort cleanup of a stale tmp from a previous crash.
     let _ = std::fs::remove_file(&tmp_path);
 
-    if let Err(e) = std::fs::write(&tmp_path, data) {
+    if let Err(e) = stage_tmp(&tmp_path, data) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
+    // Deliberately not durable: neither the staged bytes nor the rename
+    // are flushed, and no `sync_all` runs on the file or on the parent
+    // directory. The rename is here for atomicity — no reader ever sees
+    // a half-rewritten capture — not to survive a power loss. A
+    // rewritten capture is a terminal artifact of a run that is
+    // finishing; nothing reads it back to resume from, and a crash here
+    // costs the whole bundle it belongs to rather than this one file,
+    // so a pair of disk round trips per capture would buy nothing.
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
     Ok(())
+}
+
+/// Creates `tmp_path`, writes `data` into it, and leaves it at
+/// [`CAPTURE_MODE`] ready to be renamed over the capture.
+///
+/// `0o644` is a decision about what a rewritten capture should be, not
+/// a mode carried over from the input: the file ships in the bundle
+/// under `output_dir/net/` for the invoking user to read and holds no
+/// secret, so it is readable by all and writable by its owner — on
+/// every machine, whatever the sidecar produced and whatever umask
+/// `multifold` was started with.
+///
+/// Setting it explicitly is what makes that true, and the creation mode
+/// cannot stand in for it. `open(2)` masks its mode argument with the
+/// process umask, so `.mode(0o644)` would land on `0o600` under a
+/// `0o077` umask — the exact umask dependency this avoids, wearing the
+/// look of a fix. `chmod(2)` is not masked, so the call below lands on
+/// `0o644` exactly. The creation mode answers the opposite question: it
+/// is a ceiling rather than a value, keeping the incomplete file from
+/// being world-writable while the bytes stream in (which
+/// `std::fs::write`, opening at `0o666`, left to the umask). A stricter
+/// umask narrowing the temporary further is harmless — nothing reads
+/// it, and the handle's access was settled when it was opened.
+fn stage_tmp(tmp_path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(STAGING_MODE)
+        .open(tmp_path)?;
+    file.write_all(data)?;
+    file.set_permissions(Permissions::from_mode(CAPTURE_MODE))
 }
 
 fn parse_ethernet_packet(data: &[u8], ts_us: i64) -> Option<Packet> {
@@ -1421,6 +1475,84 @@ mod tests {
             .iter()
             .map(|p| (p.ts_us, p.src_port))
             .collect()
+    }
+
+    /// Mode a rewritten capture must not keep. It is what an
+    /// implementation that set the mode only at open time would leave
+    /// behind under a `0o077` umask.
+    const FOREIGN_MODE: u32 = 0o600;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn rewrite_normalizes_mode_on_byte_identical_path() {
+        // One record, so the rewritten timestamps are already monotonic
+        // and the rewriter writes the input back unchanged. The rename
+        // still happens, so the mode is still normalized.
+        let dir = tempfile::tempdir().unwrap();
+        let pkt = tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 49152, 80);
+        write_pcap(dir.path(), "capture.pcap", &[(1_737_000_000, 0, pkt)]);
+        let path = dir.path().join("capture.pcap");
+        std::fs::set_permissions(&path, Permissions::from_mode(FOREIGN_MODE)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_737_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(mode_of(&path), CAPTURE_MODE);
+    }
+
+    #[test]
+    fn rewrite_normalizes_mode_on_reassembly_path() {
+        // The second record regresses behind the first, so the rewriter
+        // sorts and reassembles rather than writing `data` back.
+        let dir = tempfile::tempdir().unwrap();
+        write_pcap(
+            dir.path(),
+            "jitter.pcap",
+            &[
+                (
+                    1_000_000_000,
+                    200_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 1, 80),
+                ),
+                (
+                    1_000_000_000,
+                    100_000,
+                    tcp_frame([10, 0, 0, 2], [10, 0, 0, 3], 2, 80),
+                ),
+            ],
+        );
+        let path = dir.path().join("jitter.pcap");
+        std::fs::set_permissions(&path, Permissions::from_mode(FOREIGN_MODE)).unwrap();
+
+        let tm = identity_map_for(fixed_ts(1_000_000_000));
+        rewrite_timestamps(&path, &tm, &[]).unwrap();
+
+        assert_eq!(
+            record_order(&path),
+            vec![(1_000_000_000_100_000, 2), (1_000_000_000_200_000, 1)],
+        );
+        assert_eq!(mode_of(&path), CAPTURE_MODE);
+    }
+
+    #[test]
+    fn write_atomic_removes_the_tmp_when_the_rename_fails() {
+        // Renaming a file over a directory cannot succeed, which is the
+        // one failure after the temporary exists that a test can provoke
+        // without special privileges. The temporary must not outlive it,
+        // and the destination must be left as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("capture.pcap");
+        std::fs::create_dir(&dest).unwrap();
+
+        assert!(write_atomic(&dest, b"rewritten").is_err());
+
+        assert!(!dir.path().join(".capture.pcap.rewrite-tmp").exists());
+        assert!(dest.is_dir());
     }
 
     #[test]

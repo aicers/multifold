@@ -172,7 +172,11 @@ pub(crate) async fn run(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Spawn each activity as an independent task.
+    // Spawn each activity as an independent task. A schedule-time
+    // overflow below returns from here, dropping `tasks` and aborting
+    // whatever earlier iterations already spawned. That is the same
+    // deliberate abort the `join_next` loop documents, arriving before
+    // the loop is reached rather than from within it.
     let mut tasks = JoinSet::new();
     for (activity, src_ip, dst_ip, command, backend) in prepared {
         let real_offset = logical_offset_to_real(activity.offset, logical_us, real_us)?;
@@ -236,6 +240,26 @@ pub(crate) async fn run(
 
     let mut results = Vec::with_capacity(tasks.len());
     while let Some(outcome) = tasks.join_next().await {
+        // Returning here drops `tasks`, which aborts every activity
+        // still in flight at whichever `.await` it had reached. That is
+        // deliberate. Only a fatal error reaches this `??` — a Docker
+        // exec failure, an SSH spawn failure, or a panic; an activity
+        // whose command merely exits non-zero returns `Ok`, so the set
+        // still drains and `main` reports the exit codes. Once one of
+        // those fires the run is over: no bundle will be assembled, and
+        // the user is waiting on the error rather than on activities
+        // whose execution environment is about to be deleted underneath
+        // them.
+        //
+        // What those aborted tasks left running is cleaned up on a
+        // best-effort basis, not reliably. `main` awaits the run into a
+        // local, tears the environment down, and only then propagates,
+        // which usually takes the commands with it — but
+        // `Env::teardown_inner` discards every failure it meets, so a
+        // VM that will not destroy or a container that will not stop
+        // leaves its command running, and teardown has no reach at all
+        // over the local `sshpass` child, which exits when its
+        // connection dies.
         results.push(outcome.context("activity task panicked")??);
     }
     results.sort_by_key(|e| e.start);
