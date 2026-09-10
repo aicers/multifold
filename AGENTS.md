@@ -8,7 +8,7 @@ carefully before generating code.
 ## Language
 
 - Code, comments, commit messages, PR descriptions, and issues are written
-  in english.
+  in English.
 
 ## Commit messages
 
