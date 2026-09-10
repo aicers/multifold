@@ -478,3 +478,8 @@ Where the crate handles key material or secrets:
 - Before committing, ensure those pass for the changed files.
 - Before pushing or opening a PR, ensure all CI jobs pass — `Markdown`,
   `Quality Check`, `Test`, the two AC-0 pipeline jobs, and `Docker E2E`.
+- `Markdown` lints the tree and then runs the shared instruction-block
+  drift check, which fails when the generated regions of this file stop
+  matching the release `.agent-instructions.toml` pins. Do not edit those
+  regions here; change them upstream and let the update workflow open the
+  pull request that moves the pin.
