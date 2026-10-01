@@ -671,7 +671,7 @@ activities:
         assert_eq!(attacker.os, Os::Linux);
         assert_eq!(attacker.role, Role::Attacker);
         assert_eq!(attacker.image, "alpine:3.19");
-        assert!(attacker.setup.is_empty());
+        assert_eq!(attacker.setup, [] as [std::string::String; 0]);
 
         let target = &s.infrastructure.hosts[1];
         assert_eq!(target.name, "target-001");
@@ -740,7 +740,10 @@ activities:
     #[test]
     fn setup_defaults_to_empty_when_omitted() {
         let s: Scenario = serde_yaml::from_str(MINIMAL_YAML).unwrap();
-        assert!(s.infrastructure.hosts[0].setup.is_empty());
+        assert_eq!(
+            s.infrastructure.hosts[0].setup,
+            [] as [std::string::String; 0]
+        );
     }
 
     // ── Duration validation ───────────────────────────────────────
@@ -1064,7 +1067,7 @@ activities:
     fn reject_malformed_yaml() {
         let yaml = "not: [valid yaml";
         let err = serde_yaml::from_str::<Scenario>(yaml).unwrap_err();
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     // ── Required section validation ────────────────────────────────

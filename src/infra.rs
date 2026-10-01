@@ -599,7 +599,7 @@ mod tests {
         let hosts: Vec<String> = vec![];
         let (gw, ips) = assign_ips("10.0.0.0/24", &hosts).unwrap();
         assert_eq!(gw, Ipv4Addr::new(10, 0, 0, 1));
-        assert!(ips.is_empty());
+        assert_eq!(ips, [] as [(std::string::String, std::net::Ipv4Addr); 0]);
     }
 
     #[test]

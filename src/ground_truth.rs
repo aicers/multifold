@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn write_empty_executions_produces_empty_file() {
         let content = write_and_read(&[]);
-        assert!(content.is_empty());
+        assert_eq!(content, "");
     }
 
     // ── normal record ─────────────────────────────────────────────
